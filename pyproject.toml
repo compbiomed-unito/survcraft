@@ -4,9 +4,9 @@ build-backend = "flit_core.buildapi"
 
 [tool.flit.metadata]
 module = "survcraft"
-author = "Survcraft Contributors"
-author-email = "survcraft@example.com"
-home-page = "https://github.com/yourusername/survcraft"
+author = "Giovanni Birolo"
+author-email = "giovanni.birolo@unito.it"
+home-page = "https://github.com/compbiomed-unito/survcraft"
 description-file = "README.md"
 requires-python = ">=3.9"
 classifiers = [
