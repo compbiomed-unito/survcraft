@@ -1,10 +1,13 @@
-import matplotlib
+import pytest
+
+matplotlib = pytest.importorskip("matplotlib")
+pytest.importorskip("pandas")
+pytest.importorskip("seaborn")
 
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
-import pytest
 import torch
 
 from survcraft import plotting
