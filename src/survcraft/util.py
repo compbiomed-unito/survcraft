@@ -1,6 +1,5 @@
 import numpy as np
 import torch
-import pandas as pd
 import inspect
 from . import adapters, loss_modules, survival_modules#, input_modules
 
@@ -45,8 +44,6 @@ def detect_max_survival_time(model, X, tol=1e-2, q=0.5):
         min_time_log = np.log10(time[max_time_idx - 1])
         max_time_log = np.log10(time[max_time_idx])
     return np.pow(10.0, max_time_log)
-
-
 
 
 def get_test_data():

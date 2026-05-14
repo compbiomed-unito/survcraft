@@ -296,7 +296,7 @@ class SurvivalEstimator(BaseEstimator):
         # sksurv seems to always put event before time, we follow the convention
         assert X.shape[0] == event.shape[0]
         if time is None:
-            assert False, "implement sksurv-style structured array"
+            assert False, "implement scikit-survival style structured array"
         else:
             min_time = time.min()
             if min_time < 0:
@@ -542,20 +542,6 @@ class SurvivalPredictor(SurvivalEstimator):
                         ).item()
                         for lf in test_losses
                     }
-                    try:
-                        risk = self.model_(
-                            "failure", X_test, median_time.unsqueeze(-1)
-                        )[:, 0]
-                        from sksurv.metrics import concordance_index_censored
-
-                        # if risk.isnan().any():
-                        #  print('risk:', risk.isnan().sum(), risk.shape[0])
-                        test_losses_vals["1 - c-index"] = (
-                            1.0
-                            - concordance_index_censored(event_test, time_test, risk)[0]
-                        )
-                    except:
-                        pass
 
             if self.history:
                 self.train_history_.append((train_losses.cpu().detach().numpy(), test_losses_vals))
