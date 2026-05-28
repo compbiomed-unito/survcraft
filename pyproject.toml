@@ -13,7 +13,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -27,9 +27,9 @@ requires = [
     "torch",
     "numpy",
     "scikit-learn",
+    "scikit-survival",
 ]
 [tool.flit.metadata.requires-extra]
 test = ["pytest"]
-tutorials = ["jupyter", "notebook"]
-sksurv = ["scikit-survival"]
+tutorials = ["jupyter", "notebook", "pandas", "matplotlib", "seaborn"]
 plotting = ["pandas", "matplotlib", "seaborn"]

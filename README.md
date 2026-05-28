@@ -211,5 +211,5 @@ before a stable release.
 
 ## License
 
-Survcraft is distributed under the Apache License 2.0. See `LICENSE` for the
+Survcraft is distributed under the GNU Lesser General Public License v3.0. See `LICENSE` for the
 full license text.
