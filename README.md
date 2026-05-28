@@ -160,9 +160,8 @@ plotting.plot_training_history(model)
 
 Notebook tutorials are included in the repository under `tutorials/`:
 
-- `01 Basic usage.ipynb`
-- `02 Hyperparameter optimization with Optuna.ipynb`
-- `03 Implementing custom layers.ipynb`
+- `Basic usage.ipynb`
+- `Implementing custom layers.ipynb`
 
 Install the tutorial dependencies with:
 
