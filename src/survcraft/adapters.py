@@ -402,6 +402,9 @@ class SurvivalPredictor(SurvivalEstimator):
             self._init_model(X, event, time)
             self.train_history_ = []
 
+        if time.min() == 0:
+            warnings.warn('Found zero times, these can cause problem in training for some survival modules')
+
         data_device = self._get_device() if self.preload_data else 'cpu'
         dataset = torch.utils.data.TensorDataset(
             *self._validate_dataset(X, event, time, device=data_device)
@@ -441,7 +444,7 @@ class SurvivalPredictor(SurvivalEstimator):
         optimizer = torch.optim.Adam(self.model_.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
         epoch = -1
         transfer_batches_to = self._get_device() if self._get_device() != data_device else None
-        #print('data dev:', next(iter(train_dl))[0].device)
+        
         for epoch in range(self.epochs):
             # TRAINING
             self.model_.train()
