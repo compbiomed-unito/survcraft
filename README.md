@@ -1,6 +1,6 @@
-# Survcraft
+# SurvCraft
 
-Survcraft is a Python library for building survival prediction models with
+SurvCraft is a Python library for building survival prediction models with
 PyTorch. It provides composable neural network input modules, survival
 distribution modules, loss functions, and scikit-learn-style adapters for
 training models on right-censored time-to-event data.
@@ -24,7 +24,7 @@ matched, or extended.
 
 ## Installation
 
-Survcraft requires Python 3.9 or newer.
+SurvCraft requires Python 3.9 or newer.
 
 The package is published on PyPI:
 
@@ -205,10 +205,10 @@ python -m twine check dist/*
 
 ## Project Status
 
-Survcraft is currently an alpha-stage research library. Public APIs may change
+SurvCraft is currently an alpha-stage research library. Public APIs may change
 before a stable release.
 
 ## License
 
-Survcraft is distributed under the GNU Lesser General Public License v3.0. See `LICENSE` for the
+SurvCraft is distributed under the GNU Lesser General Public License v3.0. See `LICENSE` for the
 full license text.
