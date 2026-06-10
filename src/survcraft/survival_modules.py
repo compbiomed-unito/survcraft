@@ -538,10 +538,11 @@ class StepExpSurvivalModule(BaseSurvivalModule):
             interval_lengths_inv, requires_grad=trainable_breaks
         )
 
-        maxerr = torch.max(torch.abs(self._get_time_breaks()[0] - breaks))
+        # check relative error in break reconstruction, there can be some little deviation for large numbers
+        maxrelerr = torch.max(torch.abs((self._get_time_breaks()[0][1:] - breaks[1:]) / breaks[1:]))
         assert (
-            maxerr < 1e-5
-        ), f"{maxerr} -> {self._get_time_breaks()[1:]} != {breaks}"
+            maxrelerr < 1e-5
+        ), f"{maxrelerr=} -> {self._get_time_breaks()[0]} != {breaks}"
 
     @staticmethod
     def _softplus_inverse(x, threshold=20):
