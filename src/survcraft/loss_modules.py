@@ -75,6 +75,15 @@ class LinearCombinationLoss(BaseSurvivalLoss):
         return " + ".join(f"{c} * {l}" for l, c in zip(self.losses, self.coeffs))
 
 class FullLikelihoodLoss(BaseSurvivalLoss):
+    def __init__(self, censoring_alpha: float = 1.0):
+        super().__init__()
+        
+        # parameter to lower weight of censored term of loss
+        # see deep survival machines paper for rationale (long tail bias)
+        if censoring_alpha < 0:
+            raise ValueError(f'censoring alpha must be non negative, got {censoring_alpha}')
+        self.censoring_alpha = censoring_alpha
+
     def forward(self, model, x, events, times):
         check_survival_outcomes(events, times)
 
@@ -86,7 +95,7 @@ class FullLikelihoodLoss(BaseSurvivalLoss):
 
         weight = events.float().mean()
 
-        return weight * loss_events + (1 - weight) * loss_censor
+        return weight * loss_events + self.censoring_alpha * (1 - weight) * loss_censor
 
 def brier(preds, pred_times, events, times):
     """
