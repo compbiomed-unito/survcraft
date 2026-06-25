@@ -15,7 +15,7 @@ def build_predictor(survival, loss):
         epochs=4,
         batch_size=32,
         verbose=0,
-        convergence_check=True,
+        check_divergence="raise",
     )
 
 
@@ -131,7 +131,7 @@ def test_predictor_fit_and_predict_with_all_discovered_trainable_modules(
         batch_size=len(X),
         learning_rate=0.001,
         verbose=0,
-        check_divergence=True,
+        check_divergence="raise",
     )
 
     predictor.fit(X, y)
