@@ -14,6 +14,7 @@ import numpy
 import torch
 import random
 import warnings
+from math import isfinite
 
 
 __all__ = [
@@ -199,18 +200,18 @@ class MixtureSurvivalAdapter(BaseSurvivalAdapter):
 def shape2str(x):
     return 'x'.join(map(str, x.shape))
 
+
+check_divergence_values = "warn", "raise", "no"
 class TorchModel(torch.nn.Module):
     """Simple torch module that applies the input and survival module together."""
 
-    def __init__(self, input_module, survival_module, check_na=False):
+    def __init__(self, input_module, survival_module, check_divergence=Literal[*check_divergence_values]):
         super().__init__()
         self.input_module = input_module
         self.survival_module = survival_module
-        self.check_na = check_na
-        # for func in ['hazard', 'failure', 'survival', 'density']:
-        #  setattr(self, func + '_l', lambda x, times: self(x, times, func))
-
-    #    def forward(self, mode, raw_params, times):
+        if check_divergence not in check_divergence_values:
+            raise ValueError(f"unknown value {check_divergence} for `check_divergence`, must be one of {check_divergence_values}")
+        self.check_divergence = check_divergence
 
     def get_raw_params(self, x):
         return self.input_module(x)
@@ -220,35 +221,23 @@ class TorchModel(torch.nn.Module):
 
     def forward(self, mode, x, times=None):
         params = self.input_module(x)
-        if self.check_na:
-            if params.isnan().any():
-                nan_desc = f"nan value in raw params: {params.isinf().sum()}inf+{params.isnan().sum()}nan/{shape2str(params)}tot"
-                if self.check_na == "raise":
-                    raise ValueError(nan_desc)
-                elif self.check_na == "warn":
+        if self.check_divergence != "no":
+            if (~params.isfinite()).any():
+                nan_desc = f"non-finite value(s) in raw params: {params.isinf().sum()}inf+{params.isnan().sum()}nan/{shape2str(params)}tot"
+                if self.check_divergence == "raise":
+                    raise ValueError(nan_desc, params)
+                elif self.check_divergence == "warn":
                     warnings.warn(nan_desc)
-        # if params.shape[-1] != self.survival_module.get_param_number():
-        #  raise ValueError(f"wrong param shape, {self.survival_module.get_param_number()} expected, {params.shape} found")
 
         preds = self.survival_module(mode, params, times)
-        if self.check_na:
-            nan_preds = preds.isnan()
-            if nan_preds.any():
-                if times is None:
-                    xpreds = preds
-                    nan_desc = f"nan value(s) in predicted {mode}: {nan_preds.sum()} in {shape2str(preds)}"
-                else:
-                    nan_ind = nan_preds.any(dim=1)
-                    nan_time = nan_preds.any(dim=0)
-                    xpreds = preds[nan_ind][:, nan_time]
-                    nan_desc = f"nan value(s) in predicted {mode}: {nan_preds.sum()} in {shape2str(preds)}"
-                # from IPython import embed
-                # print("NAN")
-                # embed()
 
-                if self.check_na == "raise":
-                    raise ValueError(nan_desc)
-                elif self.check_na == "warn":
+        if self.check_divergence != "no":
+            non_finite_preds = (~preds.isfinite()).sum().item()
+            if non_finite_preds > 0:
+                nan_desc = f"non-finite value(s) in predicted {mode}: {non_finite_preds} in {shape2str(preds)}"
+                if self.check_divergence == "raise":
+                    raise ValueError(nan_desc, preds)
+                elif self.check_divergence == "warn":
                     warnings.warn(nan_desc)
 
         return preds
@@ -262,7 +251,7 @@ class SurvivalEstimator(BaseEstimator):
 
     device: Union[str, Sequence[str]] = "cpu"
     verbose: int = 0
-    check_na: Literal["warn", "raise", False] = False
+    check_divergence: Literal[*check_divergence_values] = "raise"
     # precision: torch.dtype = torch.float32
 
     def _get_device(self):
@@ -326,7 +315,7 @@ class SurvivalEstimator(BaseEstimator):
                 output_size=survival_module.get_param_number(),
             ),
             survival_module=survival_module,
-            check_na=self.check_na,
+            check_divergence=self.check_divergence,
         ).to(self._get_device())
 
     def fit(self, X, y):
@@ -376,7 +365,6 @@ class SurvivalPredictor(SurvivalEstimator):
     gradient_clipping: bool = False
 
     # these options give convenience but may have speed impact, should evaluate with some tests
-    convergence_check: bool = True
     history: bool = False # collect training history data
 
     def fit(self, X, y, X_test=None, y_test=None):
@@ -449,7 +437,7 @@ class SurvivalPredictor(SurvivalEstimator):
             # TRAINING
             self.model_.train()
             
-            train_losses = torch.zeros(len(train_dl), dtype=torch.float32, device=self._get_device())
+            train_losses = []
             for batch, (Xb, eb, tb) in enumerate(train_dl):
                 if not eb.any():  # # no event
                     continue # ignore batch
@@ -459,43 +447,32 @@ class SurvivalPredictor(SurvivalEstimator):
                     tb = tb.to(transfer_batches_to)
 
                 loss = self.loss(self.model_, Xb, eb, tb)
-                train_losses[batch] = loss
-                    
-                if torch.isnan(loss):
-                    #print(f'loss is nan in {batch=}')
+                loss_num = loss.item()
+
+                if not isfinite(loss_num):
+                    if self.verbose >= 1:
+                        warnings.warn(
+                            f"Epoch {epoch}, batch {batch} produced non-finite loss: {loss_num}"
+                        )
                     continue  # ignore batch
+
+                train_losses.append(loss_num)
                 optimizer.zero_grad()
                 loss.backward()
-                # Add gradient clipping here
                 if self.gradient_clipping:
                     torch.nn.utils.clip_grad_norm_(self.model_.parameters(), max_norm=1.0)
                 optimizer.step()
 
-                #if self.history:
                 if self.verbose >= 3:
                     print(f"Epoch {epoch}, training batch {batch}, loss = {loss.item()}")
-                # elif (
-                #    self.verbose >= 1
-                #    and epoch % int(max(1, self.epochs / 20)) == 0
-                #    and batch % 100 == 0
-                # ):
-                # loss, current = loss.item(), batch * len(X)
-                # print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
-                #    print(f"loss {epoch}: {loss.item()}")
-            # nan_train_losses = sum(map(torch.isnan, epoch_losses))
+            bad_loss_num = len(train_dl) - len(train_losses)
+            if bad_loss_num > 0:
+                msg = f"In epoch {epoch}, {bad_loss_num} of {len(train_dl)} ({bad_loss_num/len(train_dl):.1%}) batches produced non-finite losses"
+                warnings.warn(msg)
+                if bad_loss_num == len(train_dl):
+                    raise FailedConvergence(msg)
 
-            if self.convergence_check: # this could cause some slowdown, we should try to evaluate how much and eventually deactivate it by default
-                nan_train_losses = torch.sum(torch.isnan(train_losses)).item()
-                #print(f'cv check {nan_train_losses=}')
-                #print(f'{train_losses}')
-                if nan_train_losses > 0:
-                    print(
-                        f"epoch {epoch} has {nan_train_losses}/{len(train_losses)} ({nan_train_losses / len(train_losses):.1%}) train batches with nan loss"
-                    )
-                if nan_train_losses == len(train_losses):
-                    # all batch losses are nan
-                    raise FailedConvergence()
-
+            train_losses = numpy.array(train_losses)
 
             # VALIDATION
             if val_dataset is not None:
@@ -511,6 +488,7 @@ class SurvivalPredictor(SurvivalEstimator):
                         epoch_val_losses[batch] = val_loss
                     mean_val_loss = torch.mean(epoch_val_losses)
 
+                    # early stopping code
                     if (
                         min_val_loss is None or mean_val_loss < min_val_loss
                     ):  # first epoch or new min loss
@@ -547,14 +525,14 @@ class SurvivalPredictor(SurvivalEstimator):
                     }
 
             if self.history:
-                self.train_history_.append((train_losses.cpu().detach().numpy(), test_losses_vals))
+                self.train_history_.append((train_losses, test_losses_vals))
         if epoch >= 0 and self.verbose >= 1:
             print(
-                f"Final epoch {epoch}, training loss = {torch.mean(train_losses).item()}",
+                f"Final epoch {epoch}, training loss = {train_losses.mean()}",
                 end="",
             )
             if val_dataset is not None:
-                print(f", validation loss = {mean_val_loss.item()}", end="")
+                print(f", validation loss = {mean_val_loss}", end="")
             print()
 
     

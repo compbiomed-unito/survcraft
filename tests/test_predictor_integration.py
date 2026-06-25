@@ -131,7 +131,7 @@ def test_predictor_fit_and_predict_with_all_discovered_trainable_modules(
         batch_size=len(X),
         learning_rate=0.001,
         verbose=0,
-        convergence_check=True,
+        check_divergence=True,
     )
 
     predictor.fit(X, y)
