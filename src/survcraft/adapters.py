@@ -1,6 +1,7 @@
 from . import input_modules
 from . import survival_modules
 from sklearn.base import BaseEstimator
+from . import loss_modules
 from dataclasses import dataclass, field
 from typing import ClassVar, Literal
 from torch import Tensor
@@ -8,13 +9,13 @@ from torch.nn import Module
 from typing import Union, Optional, Sequence
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Subset
-from . import loss_modules
 import copy
 import numpy
 import torch
 import random
 import warnings
-from math import isfinite
+import math
+import functools
 
 
 __all__ = [
@@ -242,6 +243,26 @@ class TorchModel(torch.nn.Module):
 
         return preds
 
+# decorator to add context to exceptions in SurvivalEstimator methods
+def add_exception_context(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as exc:
+            note = f"Raised in method {method.__name__} of {self}"
+            try:
+                exc.add_note(note)
+            except AttributeError:
+                pass # add_note was added in python 3.11
+            raise
+    return wrapper
+# TEST CODE
+#import numpy as np
+#import survcraft.adapters as ad
+#y = np.array([(0.0, False),], dtype=[('time', 'f8'), ('event', '?')])
+#ad.SurvivalPredictor().fit(np.array([0.0]), y)
+
 
 @dataclass
 class SurvivalEstimator(BaseEstimator):
@@ -326,6 +347,7 @@ class SurvivalEstimator(BaseEstimator):
     def predict_survival(self, X, times=None):
         return self.predict(mode="survival", X=X, times=times)
 
+    @add_exception_context
     def predict(self, mode, X, times=None):
         self.model_.eval()
         with torch.no_grad():
@@ -343,6 +365,7 @@ class SurvivalEstimator(BaseEstimator):
         from .plotting import plot_outputs
 
         plot_outputs(self, X, max_time=max_time)
+
 
 
 @dataclass
@@ -385,6 +408,7 @@ class SurvivalPredictor(SurvivalEstimator):
         self.train(**train_kwargs)
         return self
 
+    @add_exception_context
     def train(self, X, event, time, warm_start=False, test_data=None, test_losses=None):
         if not hasattr(self, "model_") or not warm_start:
             self._init_model(X, event, time)
@@ -449,7 +473,7 @@ class SurvivalPredictor(SurvivalEstimator):
                 loss = self.loss(self.model_, Xb, eb, tb)
                 loss_num = loss.item()
 
-                if not isfinite(loss_num):
+                if not math.isfinite(loss_num):
                     if self.verbose >= 1:
                         warnings.warn(
                             f"Epoch {epoch}, batch {batch} produced non-finite loss: {loss_num}"
