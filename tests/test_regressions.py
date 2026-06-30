@@ -22,7 +22,6 @@ def test_partial_likelihood_implementations(whas500_data):
         epochs=5,
         batch_size=64,
         verbose=0,
-        convergence_check=True,
     )
     predictor.fit(whas500_data["X_train"], whas500_data["y_train"])
 
@@ -60,7 +59,6 @@ def test_squared_loss_supports_aft_predictor(whas500_data):
         epochs=2,
         batch_size=64,
         verbose=0,
-        convergence_check=True,
     )
     predictor.fit(whas500_data["X_train"], whas500_data["y_train"])
 
