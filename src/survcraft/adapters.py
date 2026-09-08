@@ -220,26 +220,30 @@ class TorchModel(torch.nn.Module):
     def get_processed_params(self, x):
         return self.survival_module.preprocess_params(self.input_module(x))
 
+    def _check_tensor(self, x, name, times=None, context={}):
+        if self.check_divergence != "no":
+            x_fail = ~x.isfinite()
+            if x_fail.any():
+                desc = f"non-finite value(s) in {name}: {x.isinf().sum()}inf+{x.isnan().sum()}nan/{shape2str(x)}tot"
+                if times is not None:
+                    bad_sample_num = (x_fail.any(dim=1)).sum()
+                    bad_times = times[x_fail.any(dim=0)]
+                    bad_time_head = ', '.join(map(str, bad_times[:5].tolist()))
+                    if len(bad_times) > 5: bad_time_head += '...'
+                    desc += f", for {bad_sample_num} samples at {len(bad_times)} times ({bad_time_head})"
+                if self.check_divergence == "raise":
+                    ctx = {"tensor_name": name, "tensor_values": x.detach().cpu(), "times": times}
+                    ctx.update(context)
+                    raise ValueError(desc, ctx)
+                elif self.check_divergence == "warn":
+                    warnings.warn(desc)
+
     def forward(self, mode, x, times=None):
         params = self.input_module(x)
-        if self.check_divergence != "no":
-            if (~params.isfinite()).any():
-                nan_desc = f"non-finite value(s) in raw params: {params.isinf().sum()}inf+{params.isnan().sum()}nan/{shape2str(params)}tot"
-                if self.check_divergence == "raise":
-                    raise ValueError(nan_desc, params)
-                elif self.check_divergence == "warn":
-                    warnings.warn(nan_desc)
+        self._check_tensor(params, name="raw params") # times not needed since params are not indexed by times
 
         preds = self.survival_module(mode, params, times)
-
-        if self.check_divergence != "no":
-            non_finite_preds = (~preds.isfinite()).sum().item()
-            if non_finite_preds > 0:
-                nan_desc = f"non-finite value(s) in predicted {mode}: {non_finite_preds} in {shape2str(preds)}"
-                if self.check_divergence == "raise":
-                    raise ValueError(nan_desc, preds)
-                elif self.check_divergence == "warn":
-                    warnings.warn(nan_desc)
+        self._check_tensor(preds, name=mode, times=times, context={"raw_params": params})
 
         return preds
 
@@ -312,7 +316,8 @@ class SurvivalEstimator(BaseEstimator):
             if min_time < 0:
                 raise ValueError('times cannot be negative')
             if min_time == 0:
-                print('Some times are zeros, this can lead to problems for some survival distribution (e.g. Weibull)')
+                ztime = time == 0
+                warnings.warn(f'Found {ztime.sum()} ({ztime.mean():.2%}) times equal to zero, these can cause problem in training for some survival modules (e.g. Weibull)')
 
             assert X.shape[0] == time.shape[0]
             assert event.dtype == bool, (
@@ -413,9 +418,6 @@ class SurvivalPredictor(SurvivalEstimator):
         if not hasattr(self, "model_") or not warm_start:
             self._init_model(X, event, time)
             self.train_history_ = []
-
-        if time.min() == 0:
-            warnings.warn('Found zero times, these can cause problem in training for some survival modules')
 
         data_device = self._get_device() if self.preload_data else 'cpu'
         dataset = torch.utils.data.TensorDataset(
