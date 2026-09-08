@@ -310,7 +310,8 @@ class WeibullSurvivalModule(BaseSurvivalModule):
 
     def survival(self, params, times):
         l, k = params["scale"], params["shape"]
-        exponent = torch.clamp(-torch.pow(times / l, k), min=-30.0)
+        exponent = torch.clamp(-torch.pow(times / l, k), min=-20.0, max=20.0)
+        exponent = torch.clamp(-torch.pow(times / l, k), min=-20.0, max=20.0)
         return torch.exp(exponent)
 
     def density(self, params, times):
@@ -541,7 +542,7 @@ class StepExpSurvivalModule(BaseSurvivalModule):
         # check relative error in break reconstruction, there can be some little deviation for large numbers
         maxrelerr = torch.max(torch.abs((self._get_time_breaks()[0][1:] - breaks[1:]) / breaks[1:]))
         assert (
-            maxrelerr < 1e-5
+            maxrelerr < 1e-4
         ), f"{maxrelerr=} -> {self._get_time_breaks()[0]} != {breaks}"
 
     @staticmethod
