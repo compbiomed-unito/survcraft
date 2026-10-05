@@ -226,8 +226,12 @@ class TorchModel(torch.nn.Module):
             if x_fail.any():
                 desc = f"non-finite value(s) in {name}: {x.isinf().sum()}inf+{x.isnan().sum()}nan/{shape2str(x)}tot"
                 if times is not None:
-                    bad_sample_num = (x_fail.any(dim=1)).sum()
-                    bad_times = times[x_fail.any(dim=0)]
+                    if times.ndim == 0:
+                        bad_sample_num = x_fail.sum()
+                        bad_times = times.reshape(1)
+                    else:
+                        bad_sample_num = (x_fail.any(dim=1)).sum()
+                        bad_times = times[x_fail.any(dim=0)]
                     bad_time_head = ', '.join(map(str, bad_times[:5].tolist()))
                     if len(bad_times) > 5: bad_time_head += '...'
                     desc += f", for {bad_sample_num} samples at {len(bad_times)} times ({bad_time_head})"
@@ -243,7 +247,11 @@ class TorchModel(torch.nn.Module):
         self._check_tensor(params, name="raw params") # times not needed since params are not indexed by times
 
         preds = self.survival_module(mode, params, times)
-        self._check_tensor(preds, name=mode, times=times, context={"raw_params": params})
+        if mode == "params":
+            for name, values in preds.items():
+                self._check_tensor(values, name=f"params[{name}]", context={"raw_params": params})
+        else:
+            self._check_tensor(preds, name=mode, times=times, context={"raw_params": params})
 
         return preds
 
@@ -567,6 +575,7 @@ class SurvivalPredictor(SurvivalEstimator):
         if not hasattr(self, "model_"):
             raise RuntimeError("Model is not trained. Call 'train' before using this method.")
         
+        self.model_.eval()
         X_tensor = self._tensor(X)
         with torch.no_grad():
             processed_params = self.model_.get_processed_params(X_tensor)
