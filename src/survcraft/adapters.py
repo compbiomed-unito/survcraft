@@ -447,6 +447,7 @@ class SurvivalPredictor(SurvivalEstimator):
             num_workers=self.data_loader_num_workers,
             shuffle=True,  # some survival losses cannot be computed if there are no events in the batch, so we reshuffle to avoid losing the same batches everytime
         )
+        min_val_model_state = None
         if self.early_stopping:
             val_dl = torch.utils.data.DataLoader(
                 val_dataset,
@@ -472,8 +473,11 @@ class SurvivalPredictor(SurvivalEstimator):
             self.model_.train()
             
             train_losses = []
+            event_free_batches = 0
+            nonfinite_loss_batches = 0
             for batch, (Xb, eb, tb) in enumerate(train_dl):
                 if not eb.any():  # # no event
+                    event_free_batches += 1
                     continue # ignore batch
                 if transfer_batches_to is not None:
                     Xb = Xb.to(transfer_batches_to)
@@ -484,6 +488,7 @@ class SurvivalPredictor(SurvivalEstimator):
                 loss_num = loss.item()
 
                 if not math.isfinite(loss_num):
+                    nonfinite_loss_batches += 1
                     if self.verbose >= 1:
                         warnings.warn(
                             f"Epoch {epoch}, batch {batch} produced non-finite loss: {loss_num}"
@@ -499,11 +504,17 @@ class SurvivalPredictor(SurvivalEstimator):
 
                 if self.verbose >= 3:
                     print(f"Epoch {epoch}, training batch {batch}, loss = {loss.item()}")
-            bad_loss_num = len(train_dl) - len(train_losses)
-            if bad_loss_num > 0:
-                msg = f"In epoch {epoch}, {bad_loss_num} of {len(train_dl)} ({bad_loss_num/len(train_dl):.1%}) batches produced non-finite losses"
+            if event_free_batches or nonfinite_loss_batches:
+                reasons = []
+                if event_free_batches:
+                    reasons.append(f"batches without events: {event_free_batches}")
+                if nonfinite_loss_batches:
+                    reasons.append(f"batches with non-finite losses: {nonfinite_loss_batches}")
+                msg = f"Skipped training batches in epoch {epoch} ({len(train_dl)} total): " + "; ".join(reasons)
+                if not train_losses:
+                    msg += "; no usable training batches remain"
                 warnings.warn(msg)
-                if bad_loss_num == len(train_dl):
+                if not train_losses:
                     raise FailedConvergence(msg)
 
             train_losses = numpy.array(train_losses)
@@ -533,7 +544,6 @@ class SurvivalPredictor(SurvivalEstimator):
                         if epoch - min_val_epoch >= self.early_stopping_patience:
                             if self.verbose > 0:
                                 print(f"Early stop at epoch {epoch}")
-                            self.model_.load_state_dict(min_val_model_state)
                             break
 
             if self.verbose >= 1:
@@ -560,6 +570,8 @@ class SurvivalPredictor(SurvivalEstimator):
 
             if self.history:
                 self.train_history_.append((train_losses, test_losses_vals))
+        if self.early_stopping and min_val_model_state is not None:
+            self.model_.load_state_dict(min_val_model_state)
         if epoch >= 0 and self.verbose >= 1:
             print(
                 f"Final epoch {epoch}, training loss = {train_losses.mean()}",
