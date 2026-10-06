@@ -1,14 +1,18 @@
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
 from . import input_modules
 from . import survival_modules
 from sklearn.base import BaseEstimator
 from . import loss_modules
 from dataclasses import dataclass, field
-from typing import ClassVar, Literal
+from typing import Any, Callable, ClassVar, Literal, Mapping, TypeVar, cast
 from torch import Tensor
 from torch.nn import Module
 from typing import Union, Optional, Sequence
+from numpy.typing import ArrayLike
 from sklearn.model_selection import train_test_split
-from torch.utils.data import Subset
 import copy
 import numpy
 import torch
@@ -16,6 +20,12 @@ import random
 import warnings
 import math
 import functools
+
+
+CheckDivergence = Literal["warn", "raise", "no"]
+TensorPrediction = Union[Tensor, dict[str, Tensor]]
+ArrayPrediction = Union[numpy.ndarray, dict[str, numpy.ndarray]]
+Method = TypeVar("Method", bound=Callable[..., Any])
 
 
 __all__ = [
@@ -41,10 +51,14 @@ __all__ = [
 
 
 # Input modules
-class BaseInputAdapter(BaseEstimator):
-    module_class: ClassVar[Module] = None
+class BaseInputAdapter(BaseEstimator, ABC):
+    @property
+    @abstractmethod
+    def module_class(self) -> type[Module]:
+        """Module constructor, supplied by subclasses as a class attribute."""
+        raise NotImplementedError
 
-    def get_module(self, input_size, output_size):
+    def get_module(self, input_size: int, output_size: int) -> Module:
         return self.module_class(
             input_size=input_size, output_size=output_size, **self.get_params()
         )
@@ -54,7 +68,7 @@ class BaseInputAdapter(BaseEstimator):
 class LinearFunctionInputAdapter(BaseInputAdapter):
     module_class = input_modules.LinearFunctionInputModule
 
-    mode: str = "identity"
+    mode: Literal["identity", "random"] = "identity"
     multiplier: float = 1.0
     shift: float = 0.0
     use_first_n_feats: Optional[int] = None
@@ -67,8 +81,8 @@ class FeedForwardNetAdapter(BaseInputAdapter):
 
     hidden_sizes: Sequence[int] = field(default_factory=list)
     #shape: Optional[(Literal['barrel'], Literal['input'] | int, int)] = None
-    hidden_activation: type = torch.nn.ReLU
-    output_activation: type = None
+    hidden_activation: Callable[[], Module] = torch.nn.ReLU
+    output_activation: Optional[Callable[[], Module]] = None
     batch_norm: bool = False
     dropout: float = 0.0
 
@@ -85,15 +99,21 @@ class FeedForwardNetAdapter(BaseInputAdapter):
 #####################
 
 
-class BaseSurvivalAdapter(BaseEstimator):
-    module_class: ClassVar[survival_modules.BaseSurvivalModule] = None
-    # functions to be applied to parameters for preprocessing before passing it to the torch module (for instance for arrays that needs to be converted to tensors or for derived modules that need to initialized their submodules)
-    param_funcs: ClassVar[dict] = {}
+class BaseSurvivalAdapter(BaseEstimator, ABC):
+    @property
+    @abstractmethod
+    def module_class(self) -> type[survival_modules.BaseSurvivalModule]:
+        """Module constructor, supplied by subclasses as a class attribute."""
+        raise NotImplementedError
 
-    def get_module(self, event, time):
-        assert (
-            self.module_class is not None
-        ), f"{self.__class__.__name__} must set the module_class attribute!"
+    # functions to be applied to parameters for preprocessing before passing it to the torch module (for instance for arrays that needs to be converted to tensors or for derived modules that need to initialized their submodules)
+    param_funcs: ClassVar[
+        dict[str, Callable[[Any, Optional[numpy.ndarray], Optional[numpy.ndarray]], Any]]
+    ] = {}
+
+    def get_module(
+        self, event: Optional[ArrayLike], time: Optional[ArrayLike]
+    ) -> survival_modules.BaseSurvivalModule:
         if (event is None) != (time is None):
             raise ValueError("event and time must both be supplied or both be None")
         if event is not None:
@@ -137,18 +157,22 @@ class InverseGaussianSurvivalAdapter(BaseSurvivalAdapter):
 class FractalNoiseSurvivalAdapter(BaseSurvivalAdapter):
     max_time: float = 1.0
     backbone_length: int = 1
-    seed: int = None
+    seed: Optional[int] = None
 
     module_class = survival_modules.FractalNoiseSurvivalModule
 
 
 @dataclass
 class StepExpSurvivalAdapter(BaseSurvivalAdapter):
-    breaks: int | numpy.ndarray = 10
+    breaks: Union[int, ArrayLike] = 10
     trainable_breaks: bool = False
 
     @staticmethod
-    def preprocess_breaks(breaks, event, time):
+    def preprocess_breaks(
+        breaks: Union[int, ArrayLike],
+        event: Optional[numpy.ndarray],
+        time: Optional[numpy.ndarray],
+    ) -> Tensor:
         if isinstance(breaks, (int, numpy.integer)):
             if breaks < 2:
                 raise ValueError("breaks count must be at least two")
@@ -187,31 +211,25 @@ class StepExpSurvivalAdapter(BaseSurvivalAdapter):
 
 
 @dataclass
-class ProportionalHazardSurvivalAdapter(BaseSurvivalAdapter):
+class DerivedSurvivalAdapter(BaseSurvivalAdapter):
+    # abstract class for common behaviour between PH and AFT adapters
     baseline: BaseSurvivalAdapter = field(default_factory=StepExpSurvivalAdapter)
-    baseline_params: Tensor = None
+    baseline_params: Optional[ArrayLike] = None
 
-    module_class = survival_modules.ProportionalHazardSurvivalModule
-    param_funcs = {
-        "baseline": lambda x, event, time: x.get_module(event, time),
-        "baseline_params": lambda x, event, time: (
-            None if x is None else torch.tensor(x, dtype=torch.float32)
-        ),
-    }
-
-
-@dataclass
-class AcceleratedFailureTimeSurvivalAdapter(BaseSurvivalAdapter):
-    baseline: BaseSurvivalAdapter = field(default_factory=StepExpSurvivalAdapter)
-    baseline_params: Tensor = None
-
-    module_class = survival_modules.AcceleratedFailureTimeSurvivalModule
     param_funcs = {
         "baseline": lambda baseline, event, time: baseline.get_module(event, time),
         "baseline_params": lambda x, event, time: (
             None if x is None else torch.tensor(x, dtype=torch.float32)
         ),
     }
+
+@dataclass
+class ProportionalHazardSurvivalAdapter(DerivedSurvivalAdapter):
+    module_class = survival_modules.ProportionalHazardSurvivalModule
+
+@dataclass
+class AcceleratedFailureTimeSurvivalAdapter(DerivedSurvivalAdapter):
+    module_class = survival_modules.AcceleratedFailureTimeSurvivalModule
 
 
 @dataclass
@@ -222,28 +240,36 @@ class MixtureSurvivalAdapter(BaseSurvivalAdapter):
     # TODO add baseline_parameters like ProportionalHazards and AFT
 
     @staticmethod
-    def preprocess_baselines(baselines, event, time):
+    def preprocess_baselines(
+        baselines: Sequence[BaseSurvivalAdapter],
+        event: Optional[numpy.ndarray],
+        time: Optional[numpy.ndarray],
+    ) -> list[survival_modules.BaseSurvivalModule]:
         if len(baselines) < 2:
             raise ValueError("baselines must be a sequence of at least two survival adapter instances")
         return [
             b.get_module(event, time) for b in baselines
         ]
 
-
     module_class = survival_modules.MixtureSurvivalModule
     param_funcs = {
         "baselines": preprocess_baselines,
     }
 
-def shape2str(x):
+def shape2str(x: Union[Tensor, numpy.ndarray]) -> str:
     return 'x'.join(map(str, x.shape))
 
 
-check_divergence_values = "warn", "raise", "no"
+check_divergence_values: tuple[CheckDivergence, ...] = "warn", "raise", "no"
 class TorchModel(torch.nn.Module):
     """Simple torch module that applies the input and survival module together."""
 
-    def __init__(self, input_module, survival_module, check_divergence=Literal[*check_divergence_values]):
+    def __init__(
+        self,
+        input_module: Module,
+        survival_module: survival_modules.BaseSurvivalModule,
+        check_divergence: CheckDivergence = "raise",
+    ) -> None:
         super().__init__()
         self.input_module = input_module
         self.survival_module = survival_module
@@ -251,13 +277,19 @@ class TorchModel(torch.nn.Module):
             raise ValueError(f"unknown value {check_divergence} for `check_divergence`, must be one of {check_divergence_values}")
         self.check_divergence = check_divergence
 
-    def get_raw_params(self, x):
+    def get_raw_params(self, x: Tensor) -> Tensor:
         return self.input_module(x)
 
-    def get_processed_params(self, x):
+    def get_processed_params(self, x: Tensor) -> dict[str, Tensor]:
         return self.survival_module.preprocess_params(self.input_module(x))
 
-    def _check_tensor(self, x, name, times=None, context={}):
+    def _check_tensor(
+        self,
+        x: Tensor,
+        name: str,
+        times: Optional[Tensor] = None,
+        context: Mapping[str, Any] = {},
+    ) -> None:
         if self.check_divergence != "no":
             x_fail = ~x.isfinite()
             if x_fail.any():
@@ -279,7 +311,9 @@ class TorchModel(torch.nn.Module):
                 elif self.check_divergence == "warn":
                     warnings.warn(desc)
 
-    def forward(self, mode, x, times=None):
+    def forward(
+        self, mode: str, x: Tensor, times: Optional[Tensor] = None
+    ) -> TensorPrediction:
         params = self.input_module(x)
         self._check_tensor(params, name="raw params") # times not needed since params are not indexed by times
 
@@ -293,9 +327,9 @@ class TorchModel(torch.nn.Module):
         return preds
 
 # decorator to add context to exceptions in SurvivalEstimator methods
-def add_exception_context(method):
+def add_exception_context(method: Method) -> Method:
     @functools.wraps(method)
-    def wrapper(self, *args, **kwargs):
+    def wrapper(self: SurvivalEstimator, *args: Any, **kwargs: Any) -> Any:
         try:
             return method(self, *args, **kwargs)
         except Exception as exc:
@@ -305,7 +339,7 @@ def add_exception_context(method):
             except AttributeError:
                 pass # add_note was added in python 3.11
             raise
-    return wrapper
+    return cast(Method, wrapper)
 # TEST CODE
 #import numpy as np
 #import survcraft.adapters as ad
@@ -315,16 +349,16 @@ def add_exception_context(method):
 
 @dataclass
 class SurvivalEstimator(BaseEstimator):
-    input: BaseInputAdapter = None
-    survival: BaseSurvivalAdapter = None
-    loss: loss_modules.BaseSurvivalLoss = None
+    input: Optional[BaseInputAdapter] = None
+    survival: Optional[BaseSurvivalAdapter] = None
+    loss: Optional[loss_modules.BaseSurvivalLoss] = None
 
     device: Union[str, Sequence[str]] = "cpu"
     verbose: int = 0
-    check_divergence: Literal[*check_divergence_values] = "raise"
+    check_divergence: CheckDivergence = "raise"
     # precision: torch.dtype = torch.float32
 
-    def _get_device(self):
+    def _get_device(self) -> str:
         try:
             return self.device_
         except AttributeError:
@@ -337,7 +371,12 @@ class SurvivalEstimator(BaseEstimator):
             )
         return self.device_
 
-    def _tensor(self, a, dtype=torch.float32, device=None):
+    def _tensor(
+        self,
+        a: ArrayLike,
+        dtype: Optional[torch.dtype] = torch.float32,
+        device: Optional[Union[str, torch.device]] = None,
+    ) -> Tensor:
         """Convert array to tensor"""
         # if dtype is None:
         #    dtype = self.precision
@@ -351,7 +390,13 @@ class SurvivalEstimator(BaseEstimator):
         except ValueError:
             return torch.tensor(a.copy(), device=device, dtype=dtype)
 
-    def _validate_dataset(self, X, event, time=None, device=None):
+    def _validate_dataset(
+        self,
+        X: numpy.ndarray,
+        event: numpy.ndarray,
+        time: Optional[numpy.ndarray] = None,
+        device: Optional[Union[str, torch.device]] = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
         # sksurv seems to always put event before time, we follow the convention
         assert X.shape[0] == event.shape[0]
         if time is None:
@@ -375,7 +420,12 @@ class SurvivalEstimator(BaseEstimator):
         X_t = self._tensor(X, device=device)
         return X_t, event_t, time_t
 
-    def _init_model(self, X, event=None, time=None):
+    def _init_model(
+        self,
+        X: numpy.ndarray,
+        event: Optional[ArrayLike] = None,
+        time: Optional[ArrayLike] = None,
+    ) -> None:
         survival_module = self.survival.get_module(
             event=event,
             time=time,
@@ -389,16 +439,23 @@ class SurvivalEstimator(BaseEstimator):
             check_divergence=self.check_divergence,
         ).to(self._get_device())
 
-    def fit(self, X, y):
+    def fit(self, X: numpy.ndarray, y: numpy.ndarray) -> SurvivalEstimator:
         # warnings.warn(f"Fit of {self.__class__.__name__} does nothing")
         # print(f"Fit of {self.__class__.__name__} does nothing") # maybe use a warning
         return self
 
-    def predict_survival(self, X, times=None):
-        return self.predict(mode="survival", X=X, times=times)
+    def predict_survival(
+        self, X: numpy.ndarray, times: Optional[ArrayLike] = None
+    ) -> numpy.ndarray:
+        return cast(numpy.ndarray, self.predict(mode="survival", X=X, times=times))
 
     @add_exception_context
-    def predict(self, mode, X, times=None):
+    def predict(
+        self,
+        mode: str,
+        X: numpy.ndarray,
+        times: Optional[ArrayLike] = None,
+    ) -> ArrayPrediction:
         self.model_.eval()
         with torch.no_grad():
             result = self.model_(
@@ -411,7 +468,7 @@ class SurvivalEstimator(BaseEstimator):
         else:
             return result.detach().cpu().numpy()
 
-    def plot(self, X, max_time=None):
+    def plot(self, X: numpy.ndarray, max_time: Optional[float] = None) -> None:
         from .plotting import plot_outputs
 
         plot_outputs(self, X, max_time=max_time)
@@ -440,7 +497,13 @@ class SurvivalPredictor(SurvivalEstimator):
     # these options give convenience but may have speed impact, should evaluate with some tests
     history: bool = False # collect training history data
 
-    def fit(self, X, y, X_test=None, y_test=None):
+    def fit(
+        self,
+        X: numpy.ndarray,
+        y: numpy.ndarray,
+        X_test: Optional[numpy.ndarray] = None,
+        y_test: Optional[numpy.ndarray] = None,
+    ) -> SurvivalPredictor:
         train_kwargs = {
             'X': X,
             'event': y[y.dtype.names[0]].copy(),
@@ -459,7 +522,15 @@ class SurvivalPredictor(SurvivalEstimator):
         return self
 
     @add_exception_context
-    def train(self, X, event, time, warm_start=False, test_data=None, test_losses=None):
+    def train(
+        self,
+        X: numpy.ndarray,
+        event: numpy.ndarray,
+        time: numpy.ndarray,
+        warm_start: bool = False,
+        test_data: Optional[tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]] = None,
+        test_losses: Optional[Sequence[loss_modules.BaseSurvivalLoss]] = None,
+    ) -> None:
         if not hasattr(self, "model_") or not warm_start:
             self._init_model(X, event, time)
             self.train_history_ = []
@@ -619,7 +690,7 @@ class SurvivalPredictor(SurvivalEstimator):
             print()
 
     
-    def get_distribution_params(self, X):
+    def get_distribution_params(self, X: numpy.ndarray) -> dict[str, Tensor]:
         """Get the distribution parameters for given input data."""
         if not hasattr(self, "model_"):
             raise RuntimeError("Model is not trained. Call 'train' before using this method.")
@@ -637,7 +708,12 @@ class SurvivalSimulator(SurvivalEstimator):
     survival: BaseSurvivalAdapter = field(default_factory=ExponentialSurvivalAdapter)
     # precision: torch.dtype = torch.float64
 
-    def predict(self, mode, X, times=None):
+    def predict(
+        self,
+        mode: str,
+        X: numpy.ndarray,
+        times: Optional[ArrayLike] = None,
+    ) -> ArrayPrediction:
         # in simulator
         # assert isinstance(mode, str)
         if not hasattr(self, "model_"):
@@ -645,13 +721,18 @@ class SurvivalSimulator(SurvivalEstimator):
 
         return super().predict(mode, X, times=times)
 
-    def simulate(self, X, times=None, seed=None):
+    def simulate(
+        self,
+        X: numpy.ndarray,
+        times: Optional[numpy.ndarray] = None,
+        seed: Optional[int] = None,
+    ) -> numpy.ndarray:
         assert times is not None, "implement auto times?"
         if not hasattr(self, "model_"):
             self._init_model(X, None, None)
 
         # compute probability of event for each time (interval)
-        f = self.predict("failure", X, times)
+        f = cast(numpy.ndarray, self.predict("failure", X, times))
         p = numpy.zeros_like(f)
         p[..., :-1] = f[..., 1:] - f[..., :-1]
         monot = f[..., 1:] >= f[..., :-1]

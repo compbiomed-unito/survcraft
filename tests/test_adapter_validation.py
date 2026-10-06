@@ -14,6 +14,31 @@ COMPOSITE_ADAPTERS = [
 ]
 
 
+@pytest.mark.parametrize("base_class", [ad.BaseInputAdapter, ad.BaseSurvivalAdapter])
+def test_base_adapters_are_abstract(base_class):
+    with pytest.raises(TypeError, match="abstract.*module_class"):
+        base_class()
+
+    class MissingModuleAdapter(base_class):
+        pass
+
+    with pytest.raises(TypeError, match="abstract.*module_class"):
+        MissingModuleAdapter()
+
+
+@pytest.mark.parametrize("adapter_class", [
+    ad.LinearFunctionInputAdapter,
+    ad.FeedForwardNetAdapter,
+    ad.ExponentialSurvivalAdapter,
+    ad.StepExpSurvivalAdapter,
+])
+def test_module_class_attribute_satisfies_abstract_contract(adapter_class):
+    adapter = clone(adapter_class())
+    assert isinstance(adapter.module_class, type)
+    assert issubclass(adapter.module_class, torch.nn.Module)
+    assert "module_class" not in adapter.get_params()
+
+
 @pytest.mark.parametrize("adapter_class", COMPOSITE_ADAPTERS)
 @pytest.mark.parametrize("use_data", [False, True])
 def test_default_baselines_construct_and_predict(adapter_class, use_data):
