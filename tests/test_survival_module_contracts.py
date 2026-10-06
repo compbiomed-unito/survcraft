@@ -111,3 +111,33 @@ def test_discovered_modules_support_time_mode_contracts(module_cls, mode):
 @pytest.mark.parametrize("mode", FIXED_MODES)
 def test_discovered_modules_handle_fixed_modes_gracefully(module_cls, mode):
     assert_fixed_mode_contract(build_module(module_cls), mode)
+
+
+@pytest.mark.parametrize(
+    "module_cls",
+    [
+        sm.ExponentialSurvivalModule,
+        sm.ProportionalHazardSurvivalModule,
+        sm.AcceleratedFailureTimeSurvivalModule,
+    ],
+    ids=module_id,
+)
+def test_larger_risk_predicts_earlier_events(module_cls):
+    rates = torch.tensor([0.5, 1.0, 2.0])
+    raw_params = torch.log(torch.expm1(rates)).unsqueeze(-1)
+    if module_cls is sm.ExponentialSurvivalModule:
+        module = module_cls()
+    else:
+        module = module_cls(
+            baseline=sm.ExponentialSurvivalModule(),
+            baseline_params=torch.log(torch.expm1(torch.ones(1))),
+        )
+    module.eval()
+
+    risk = module("risk", raw_params)
+    survival = module("survival", raw_params, VECTOR_TIMES)
+
+    # These models all give S(t) = exp(-rate * t) for this baseline.
+    torch.testing.assert_close(survival, torch.exp(-rates[:, None] * VECTOR_TIMES))
+    assert torch.all(survival[1:] < survival[:-1])
+    assert torch.all(risk[1:] > risk[:-1])

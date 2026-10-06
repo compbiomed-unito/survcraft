@@ -241,6 +241,7 @@ class BaseSurvivalModule(torch.nn.Module):
         )
 
     def risk(self, params):
+        """Return a score whose larger values indicate earlier events."""
         raise NotImplementedError(
             f"risk method not implemented in {type(self).__name__}"
         )
@@ -726,7 +727,7 @@ class AcceleratedFailureTimeSurvivalModule(BaseSurvivalModule):
 
     def risk(self, params):
         rr = params["relative_risk"]
-        return 1.0 / rr.squeeze(dim=1)
+        return rr.squeeze(dim=1)
 
     def expected_time(self, params):
         rr = params["relative_risk"]
