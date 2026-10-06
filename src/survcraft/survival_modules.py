@@ -690,10 +690,6 @@ class AcceleratedFailureTimeSurvivalModule(BaseSurvivalModule):
         super().__init__([PositiveParameter("relative_risk")], *args, **kwargs)
         self.baseline = baseline
 
-        self.baseline_params = torch.nn.Parameter(
-            torch.empty(self.baseline.get_param_number())
-        )
-
         # if not given, create a vector of trainable parameters for the baseline
         param_num = self.baseline.get_param_number()
         if baseline_params is None:

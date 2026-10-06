@@ -74,17 +74,7 @@ def test_default_baseline_parameters_are_trainable(adapter_class):
     assert torch.isfinite(raw.grad).all()
 
 
-@pytest.mark.parametrize("adapter_class", [
-    ad.ProportionalHazardSurvivalAdapter,
-    pytest.param(
-        ad.AcceleratedFailureTimeSurvivalAdapter,
-        marks=pytest.mark.xfail(
-            raises=TypeError,
-            strict=True,
-            reason="AFT pre-registers baseline_params as a Parameter before assigning the fixed tensor",
-        ),
-    ),
-])
+@pytest.mark.parametrize("adapter_class", COMPOSITE_ADAPTERS[:2])
 @pytest.mark.parametrize("baseline_params", [[0.5], np.array([0.5], dtype=np.float64)])
 def test_fixed_baseline_parameters_control_predictions(adapter_class, baseline_params):
     module = adapter_class(
