@@ -145,11 +145,14 @@ def test_two_component_mixture_matches_weighted_baselines(sequence_class):
     (0, "at least two"), (1, "at least two"), (-2, "at least two"),
     (2.5, "one-dimensional"), (None, "one-dimensional"),
     ([], "at least two"), ([0], "at least two"), ([[0, 1]], "one-dimensional"),
+    ([[0], [1, 2]], "one-dimensional"),
+    ([False, True], "numeric"),
     ([0, np.nan], "finite"), ([0, np.inf], "finite"),
     ([0, "a"], "numeric"), ([0, 1j], "numeric"),
-    ([1, 2], "start with zero"), ([-1, 0], "start with zero"),
+    ([1, 2], "start at zero"), ([-1, 0], "finite nonnegative"),
     ([0, 0], "strictly increasing"), ([0, 2, 1], "strictly increasing"),
     ([0, 1, 1 + 1e-10], "float32"), ([0, 1e40], "float32"),
+    ([0, 1e-50], "float32"),
 ])
 def test_invalid_step_breaks_rejected(breaks, message):
     with pytest.raises(ValueError, match=message):

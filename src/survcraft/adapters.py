@@ -50,6 +50,34 @@ __all__ = [
 ]
 
 
+def _validate_time_grid(values: ArrayLike, *, name: str) -> numpy.ndarray:
+    """Return a zero-based, strictly increasing grid in model float32 precision."""
+
+    try:
+        grid = numpy.asarray(values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a one-dimensional numeric grid") from exc
+    if grid.ndim != 1 or grid.size < 2:
+        raise ValueError(f"{name} must be one-dimensional with at least two points")
+    if (
+        grid.dtype.kind not in "iuf"
+        or not numpy.isfinite(grid).all()
+        or (grid < 0).any()
+    ):
+        raise ValueError(f"{name} must contain finite nonnegative numeric values")
+    if grid[0] != 0:
+        raise ValueError(f"{name} must start at zero")
+    if not (grid[1:] > grid[:-1]).all():
+        raise ValueError(f"{name} must be strictly increasing")
+    with numpy.errstate(over="ignore", under="ignore", invalid="ignore"):
+        grid = grid.astype(numpy.float32)
+    if not numpy.isfinite(grid).all():
+        raise ValueError(f"{name} must remain finite after float32 conversion")
+    if not (grid[1:] > grid[:-1]).all():
+        raise ValueError(f"{name} must remain strictly increasing after float32 conversion")
+    return grid
+
+
 # Input modules
 class BaseInputAdapter(BaseEstimator, ABC):
     @property
@@ -188,20 +216,8 @@ class StepExpSurvivalAdapter(BaseSurvivalAdapter):
                 if len(time_breaks) < breaks:
                     warnings.warn(f'only {len(time_breaks)} unique breaks were obtained instead of the {breaks} breaks requested in the argument for the StepExpSurvivalAdapter', stacklevel=2)
         else:
-            time_breaks = numpy.asarray(breaks)
-        if time_breaks.ndim != 1 or time_breaks.size < 2:
-            raise ValueError("breaks must be a one-dimensional vector with at least two entries")
-        if time_breaks.dtype.kind not in "iuf" or not numpy.isfinite(time_breaks).all():
-            raise ValueError("breaks must contain finite numeric values")
-        if time_breaks[0] != 0:
-            raise ValueError("breaks must start with zero")
-        if not (time_breaks[1:] > time_breaks[:-1]).all():
-            raise ValueError("breaks must be strictly increasing")
-        with numpy.errstate(over="ignore", under="ignore"):
-            time_breaks = time_breaks.astype(numpy.float32)
-        if not numpy.isfinite(time_breaks).all() or not (time_breaks[1:] > time_breaks[:-1]).all():
-            raise ValueError("breaks must remain finite and strictly increasing in float32")
-        return torch.tensor(time_breaks)
+            time_breaks = breaks
+        return torch.tensor(_validate_time_grid(time_breaks, name="breaks"))
  
 
     module_class = survival_modules.StepExpSurvivalModule
@@ -744,10 +760,43 @@ class SurvivalSimulator(SurvivalEstimator):
     def simulate(
         self,
         X: numpy.ndarray,
-        times: Optional[numpy.ndarray] = None,
+        times: ArrayLike,
         seed: Optional[int] = None,
     ) -> numpy.ndarray:
-        assert times is not None, "implement auto times?"
+        """Sample event times on a grid, with censoring at its final point.
+
+        Parameters
+        ----------
+        X : numpy.ndarray
+            Feature matrix with one row per sample.
+        times : array-like
+            Required one-dimensional numeric grid with at least two finite,
+            nonnegative points, starting at zero and strictly increasing.
+            Finiteness and ordering must also hold after float32 conversion,
+            the precision used for prediction and returned times.
+        seed : int, optional
+            Seed for event sampling; does not seed model initialization.
+
+        Returns
+        -------
+        numpy.ndarray
+            Structured array with boolean ``event`` and float32 ``time`` fields.
+            Events in each grid interval are placed at its midpoint. Samples
+            surviving the final grid point are censored at that point.
+
+        Raises
+        ------
+        ValueError
+            If the time grid is missing or violates the grid requirements.
+
+        Notes
+        -----
+        For consecutive grid points, interval probability is the difference
+        between their predicted failure probabilities. The remaining probability
+        is assigned to censoring at the final point. Starting at zero includes
+        the initial event probability in the first interval.
+        """
+        times = _validate_time_grid(times, name="times")
         if not hasattr(self, "model_"):
             self._init_model(X, None, None)
 
@@ -783,18 +832,22 @@ class SurvivalSimulator(SurvivalEstimator):
         rng = numpy.random.default_rng(seed=seed)
         event_time = numpy.zeros(p.shape[0])
         # get the center of each time interval, keep last value unchanged
-        mid_times = numpy.concatenate(((times[1:] + times[:-1]) / 2, times[-1:]))
+        # Compute in float64 to avoid overflow when adding large finite points.
+        midpoint_grid = times.astype(numpy.float64)
+        mid_times = numpy.concatenate(((midpoint_grid[1:] + midpoint_grid[:-1]) / 2, midpoint_grid[-1:]))
+        event_indicator = numpy.zeros(p.shape[0], dtype=bool)
         for i, pi in enumerate(p):
             # if any(pi < 0):
             #    print(i, pi.min(), pi.argmin(), pi)
             #    event_time[i] = -1
             # else:
-            event_time[i] = mid_times[rng.choice(len(pi), p=pi)]
+            interval = rng.choice(len(pi), p=pi)
+            event_time[i] = mid_times[interval]
+            event_indicator[i] = interval < len(pi) - 1
         # event_time = numpy.array([
         #   times[rng.choice(p.shape[1], p=p[i])]
         #    for i in range(p.shape[0])
         # ])
-        event_indicator = event_time < times[-1]
 
         # build a structure array like in scikit-survival
         y = numpy.zeros(len(X), dtype=[("event", "?"), ("time", "f4")])

@@ -16,7 +16,7 @@ from survcraft.util import get_loss_modules, get_subclasses_in_module, get_survi
 def test_default_simulator_and_predictor_training_parameters_work_together(history, check_divergence, preload_data, gradient_clipping, early_stopping, warm_start):
     rng = np.random.default_rng(1)
     X = rng.normal(size=(72, 3)).astype(np.float32)
-    times = np.linspace(0.1, 2.5, 32, dtype=np.float32)
+    times = np.linspace(0.0, 2.5, 32, dtype=np.float32)
 
     simulator = ad.SurvivalSimulator(device="cpu", check_divergence="warn")
     y = simulator.simulate(X=X, times=times, seed=7)
@@ -69,4 +69,3 @@ def test_invalid_check_divergence_is_rejected_when_model_is_initialized():
 
     with pytest.raises(ValueError, match="check_divergence"):
         simulator.predict("failure", np.zeros((2, 1), dtype=np.float32), np.array([1.0]))
-

@@ -36,7 +36,7 @@ def whas500_data():
 def simulated_dataset():
     rng = np.random.default_rng(0)
     X = rng.normal(size=(96, 4)).astype(np.float32)
-    times = np.linspace(0.1, 3.0, 48, dtype=np.float32)
+    times = np.linspace(0.0, 3.0, 48, dtype=np.float32)
     simulator = ad.SurvivalSimulator(
         input=ad.LinearFunctionInputAdapter(),
         survival=ad.StepExpSurvivalAdapter(breaks=6),
