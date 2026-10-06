@@ -94,6 +94,20 @@ class BaseSurvivalAdapter(BaseEstimator):
         assert (
             self.module_class is not None
         ), f"{self.__class__.__name__} must set the module_class attribute!"
+        if (event is None) != (time is None):
+            raise ValueError("event and time must both be supplied or both be None")
+        if event is not None:
+            event, time = numpy.asarray(event), numpy.asarray(time)
+            if event.ndim != 1 or time.ndim != 1 or event.shape != time.shape:
+                raise ValueError("event and time must be matching one-dimensional arrays")
+            if event.dtype != numpy.bool_:
+                raise ValueError("event must be a boolean array")
+            if (
+                time.dtype.kind not in "iuf"
+                or not numpy.isfinite(time).all()
+                or (time < 0).any()
+            ):
+                raise ValueError("time must contain finite nonnegative numbers")
         params = {
             k: self.param_funcs.get(k, lambda x, event, time: x)(v, event, time)
             for k, v in self.get_params(deep=False).items()
@@ -135,26 +149,35 @@ class StepExpSurvivalAdapter(BaseSurvivalAdapter):
 
     @staticmethod
     def preprocess_breaks(breaks, event, time):
-        # estimate time_breaks if not given
-        if isinstance(breaks, int): # breaks is just the number of intervals
-            # create actual time breaks
-            time_breaks = numpy.linspace(0, 1, breaks + 1)[:-1]
-            if event is not None and time is not None:  # deduce from event and time
-                time_breaks = numpy.unique(numpy.quantile(time[event], time_breaks))
-                if len(time_breaks) < breaks:
-                    warnings.warn(f'only {len(time_breaks)} unique breaks were obtained instead of the {breaks} breaks requested in the argument for the StepExpSurvivalAdapter')
+        if isinstance(breaks, (int, numpy.integer)):
+            if breaks < 2:
+                raise ValueError("breaks count must be at least two")
+            time_breaks = numpy.arange(breaks, dtype=float) / breaks
+            if event is not None:
+                event_times = time[event]
+                if event_times.size == 0:
+                    raise ValueError("cannot derive breaks without observed event times")
+                time_breaks = numpy.unique(numpy.quantile(event_times, time_breaks))
                 time_breaks[0] = 0.0
+                if len(time_breaks) < 2:
+                    raise ValueError("cannot derive at least two unique breaks from observed event times; provide explicit breaks")
+                if len(time_breaks) < breaks:
+                    warnings.warn(f'only {len(time_breaks)} unique breaks were obtained instead of the {breaks} breaks requested in the argument for the StepExpSurvivalAdapter', stacklevel=2)
         else:
-            time_breaks = breaks
-
-            # else raise ValueError('Either time_breaks or event and time needs to be not None') # FIXME maybe better message?
-
-        # check that is a sorted vector
-        #assert len(time_breaks.shape) == 1, "time_breaks must be a vector"
-        # add time zero if missing
-        #if time_breaks[0] > 0:
-        #    time_breaks = numpy.concatenate([[0.0], time_breaks[1:]])
-        return torch.tensor(time_breaks.astype(numpy.float32))
+            time_breaks = numpy.asarray(breaks)
+        if time_breaks.ndim != 1 or time_breaks.size < 2:
+            raise ValueError("breaks must be a one-dimensional vector with at least two entries")
+        if time_breaks.dtype.kind not in "iuf" or not numpy.isfinite(time_breaks).all():
+            raise ValueError("breaks must contain finite numeric values")
+        if time_breaks[0] != 0:
+            raise ValueError("breaks must start with zero")
+        if not (time_breaks[1:] > time_breaks[:-1]).all():
+            raise ValueError("breaks must be strictly increasing")
+        with numpy.errstate(over="ignore", under="ignore"):
+            time_breaks = time_breaks.astype(numpy.float32)
+        if not numpy.isfinite(time_breaks).all() or not (time_breaks[1:] > time_breaks[:-1]).all():
+            raise ValueError("breaks must remain finite and strictly increasing in float32")
+        return torch.tensor(time_breaks)
  
 
     module_class = survival_modules.StepExpSurvivalModule
@@ -165,7 +188,7 @@ class StepExpSurvivalAdapter(BaseSurvivalAdapter):
 
 @dataclass
 class ProportionalHazardSurvivalAdapter(BaseSurvivalAdapter):
-    baseline: BaseSurvivalAdapter = None
+    baseline: BaseSurvivalAdapter = field(default_factory=StepExpSurvivalAdapter)
     baseline_params: Tensor = None
 
     module_class = survival_modules.ProportionalHazardSurvivalModule
@@ -179,23 +202,37 @@ class ProportionalHazardSurvivalAdapter(BaseSurvivalAdapter):
 
 @dataclass
 class AcceleratedFailureTimeSurvivalAdapter(BaseSurvivalAdapter):
-    baseline: BaseSurvivalAdapter = None
+    baseline: BaseSurvivalAdapter = field(default_factory=StepExpSurvivalAdapter)
+    baseline_params: Tensor = None
 
     module_class = survival_modules.AcceleratedFailureTimeSurvivalModule
     param_funcs = {
         "baseline": lambda baseline, event, time: baseline.get_module(event, time),
+        "baseline_params": lambda x, event, time: (
+            None if x is None else torch.tensor(x, dtype=torch.float32)
+        ),
     }
 
 
 @dataclass
 class MixtureSurvivalAdapter(BaseSurvivalAdapter):
-    baselines: Sequence[BaseSurvivalAdapter] = field(default_factory=list)
+    baselines: Sequence[BaseSurvivalAdapter] = field(
+        default_factory=lambda: [StepExpSurvivalAdapter() for _ in range(3)]
+    )
+    # TODO add baseline_parameters like ProportionalHazards and AFT
+
+    @staticmethod
+    def preprocess_baselines(baselines, event, time):
+        if len(baselines) < 2:
+            raise ValueError("baselines must be a sequence of at least two survival adapter instances")
+        return [
+            b.get_module(event, time) for b in baselines
+        ]
+
 
     module_class = survival_modules.MixtureSurvivalModule
     param_funcs = {
-        "baselines": lambda baselines, event, time: [
-            baseline.get_module(event, time) for baseline in baselines
-        ]
+        "baselines": preprocess_baselines,
     }
 
 def shape2str(x):

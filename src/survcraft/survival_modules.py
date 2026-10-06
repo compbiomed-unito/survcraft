@@ -524,6 +524,10 @@ class StepExpSurvivalModule(BaseSurvivalModule):
         # check that is a sorted vector
         if len(breaks.shape) != 1:
             raise ValueError(f"breaks must be a vector, instead found {breaks.shape=}")
+        if breaks.numel() < 2:
+            raise ValueError("breaks must contain at least two entries")
+        if not torch.isfinite(breaks).all():
+            raise ValueError("breaks must contain finite values")
         if breaks[0] != 0:
             raise ValueError(f"breaks must start with zero, instead found {breaks}")
         time_lengths = breaks[1:] - breaks[:-1]
@@ -547,7 +551,7 @@ class StepExpSurvivalModule(BaseSurvivalModule):
 
     @staticmethod
     def _softplus_inverse(x, threshold=20):
-        return torch.where(x < threshold, torch.log(torch.exp(x) - 1), x)
+        return torch.where(x < threshold, torch.log(torch.expm1(x)), x)
 
     def _get_time_breaks(self):
         interval_length = torch.nn.functional.softplus(self.interval_size)
