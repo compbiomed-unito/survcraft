@@ -497,6 +497,24 @@ class SurvivalPredictor(SurvivalEstimator):
     # these options give convenience but may have speed impact, should evaluate with some tests
     history: bool = False # collect training history data
 
+    @staticmethod
+    def _extract_target(
+        y: numpy.ndarray, name: str
+    ) -> tuple[numpy.ndarray, numpy.ndarray]:
+        if not isinstance(y, numpy.ndarray) or y.ndim != 1:
+            raise ValueError(f"{name} must be a one-dimensional NumPy structured array")
+        names = y.dtype.names
+        if names is None or len(names) != 2:
+            raise ValueError(f"{name} must have exactly two fields: event first, time second")
+        event, time = y[names[0]], y[names[1]]
+        if event.ndim != 1 or event.dtype != numpy.bool_:
+            raise ValueError(f"{name}'s first field must contain scalar boolean events")
+        if time.ndim != 1 or time.dtype.kind not in "iuf":
+            raise ValueError(f"{name}'s second field must contain scalar real numeric times")
+        if not numpy.isfinite(time).all() or (time < 0).any():
+            raise ValueError(f"{name}'s times must be finite nonnegative numbers")
+        return event.copy(), time.copy()
+
     def fit(
         self,
         X: numpy.ndarray,
@@ -504,18 +522,20 @@ class SurvivalPredictor(SurvivalEstimator):
         X_test: Optional[numpy.ndarray] = None,
         y_test: Optional[numpy.ndarray] = None,
     ) -> SurvivalPredictor:
+        event, time = self._extract_target(y, "y")
         train_kwargs = {
             'X': X,
-            'event': y[y.dtype.names[0]].copy(),
-            'time': y[y.dtype.names[1]].copy(),
+            'event': event,
+            'time': time,
             'warm_start': self.warm_start,
         }
         
         if X_test is not None and y_test is not None:
+            event_test, time_test = self._extract_target(y_test, "y_test")
             train_kwargs['test_data'] = (
                 X_test,
-                y_test[y.dtype.names[0]].copy(),
-                y_test[y.dtype.names[1]].copy(),
+                event_test,
+                time_test,
             )
         
         self.train(**train_kwargs)
