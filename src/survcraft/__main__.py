@@ -1,3 +1,12 @@
+r"""Print locally defined adapter, input, survival, and loss classes.
+
+Notes
+-----
+Running ``python -m survcraft`` lists classes and whether Python marks
+them abstract. Discovery does not verify that every prediction mode
+is implemented.
+"""
+
 from . import adapters
 from . import survival_modules
 from . import loss_modules

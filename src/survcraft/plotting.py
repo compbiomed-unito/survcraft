@@ -1,3 +1,12 @@
+r"""Plot survival distributions and recorded training losses.
+
+Notes
+-----
+Requires the plotting extras: pandas, matplotlib, and seaborn. Functions
+create matplotlib figures as side effects and return None unless stated
+otherwise. Model data and prediction contracts are in SurvivalEstimator.
+"""
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -7,6 +16,30 @@ from .util import detect_max_survival_time
 
 
 def plot_model(model, X, event, time):
+    r"""Plot failure curves and observed-time markers for five sampled rows.
+
+    Parameters
+    ----------
+    model : SurvivalEstimator
+        Initialized model supporting the requested prediction modes.
+    X : numpy.ndarray, shape (n_samples, n_features)
+        Numeric feature matrix.
+    event : numpy.ndarray of bool, shape (n_samples,)
+        Event indicators; censoring markers use dotted lines.
+    time : numpy.ndarray, shape (n_samples,)
+        Observed event or censoring times.
+
+    Returns
+    -------
+    None
+        Creates a matplotlib figure and prints raw sample parameters.
+
+    Notes
+    -----
+    Samples rows with replacement using an unseeded local NumPy generator.
+    The current plotting horizon is fixed at 110, and markers are clipped
+    to that horizon.
+    """
     rng = np.random.default_rng()
     sub_idx = rng.choice(X.shape[0], size=5)
     sub_times, sub_events = time[sub_idx], event[sub_idx]
@@ -31,6 +64,32 @@ def plot_model(model, X, event, time):
 
 def plot_outputs(model, X, max_time=None):
     # time = np.linspace(0.0, times_train[events_train].max(), 101)
+    r"""Plot failure, survival, density, and hazard curves in four panels.
+
+    Parameters
+    ----------
+    model : SurvivalEstimator
+        Initialized model supporting the requested prediction modes.
+    X : numpy.ndarray, shape (n_samples, n_features)
+        Numeric feature matrix.
+    max_time : float, optional
+        Final evaluation time; inferred from survival curves if omitted.
+
+    Returns
+    -------
+    None
+        Creates a matplotlib figure with a logarithmic hazard axis.
+
+    Notes
+    -----
+    Uses 101 grid points including zero. Some densities or hazards are
+    singular at zero; such models may fail under divergence checks. Prints
+    the inferred horizon when max_time is omitted.
+
+    See Also
+    --------
+    survcraft.util.detect_max_survival_time : Horizon heuristic.
+    """
     if max_time is None:
         max_time = detect_max_survival_time(model, X)
         print("estimated max time:", max_time)  # time[-1].item())
@@ -76,6 +135,25 @@ def plot_outputs(model, X, max_time=None):
 
 
 def get_training_history_table(model):
+    r"""Convert recorded batch and test losses to a two-level table.
+
+    Parameters
+    ----------
+    model : SurvivalPredictor
+        Predictor with train_history_ populated by history=True.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Rows are epochs; columns group train batch indices and test loss
+        names. Unequal batch counts are padded with missing values.
+
+    Notes
+    -----
+    The implementation expects entries to expose item(). Current predictor
+    test-loss history contains Python floats, which do not expose it; review
+    this helper before using it with test-loss history.
+    """
     train_losses = pd.DataFrame(
         [[l.item() for l in epoch[0]] for epoch in model.train_history_]
     )
@@ -86,6 +164,24 @@ def get_training_history_table(model):
 
 
 def plot_training_history(model):
+    r"""Plot normalized epoch training and test losses on a log scale.
+
+    Parameters
+    ----------
+    model : SurvivalPredictor
+        Predictor with train_history_ populated by history=True.
+
+    Returns
+    -------
+    None
+        Creates a matplotlib figure.
+
+    Notes
+    -----
+    Training loss is the unweighted mean of usable batch losses. Every
+    series is divided by its maximum before plotting; zero maxima, zero
+    values, and negative objectives require care on a log axis.
+    """
     train_loss = pd.DataFrame(
         [epoch[0] for epoch in model.train_history_]
     )

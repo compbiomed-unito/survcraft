@@ -1,3 +1,13 @@
+r"""Scikit-learn estimators and factories for composable survival models.
+
+Notes
+-----
+Adapters build fresh PyTorch modules from estimator parameters. See
+:class:`SurvivalEstimator` for data, prediction, device, and fitted-state
+contracts; :class:`SurvivalPredictor` trains models and
+:class:`SurvivalSimulator` samples from fixed models.
+"""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -51,7 +61,25 @@ __all__ = [
 
 
 def _validate_time_grid(values: ArrayLike, *, name: str) -> numpy.ndarray:
-    """Return a zero-based, strictly increasing grid in model float32 precision."""
+    r"""Validate a zero-based increasing grid in model float32 precision.
+
+    Parameters
+    ----------
+    values : array-like
+        One-dimensional numeric time grid with at least two points.
+    name : str
+        Argument name used in diagnostics.
+
+    Returns
+    -------
+    numpy.ndarray of float32
+        Finite nonnegative grid starting at zero and strictly increasing.
+
+    Raises
+    ------
+    ValueError
+        If the grid violates these conditions, including after conversion.
+    """
 
     try:
         grid = numpy.asarray(values)
@@ -80,13 +108,50 @@ def _validate_time_grid(values: ArrayLike, *, name: str) -> numpy.ndarray:
 
 # Input modules
 class BaseInputAdapter(BaseEstimator, ABC):
+    r"""Construct input modules from scikit-learn estimator parameters.
+
+    Attributes
+    ----------
+    module_class : type of torch.nn.Module
+        Constructor supplied by each concrete adapter.
+
+    Notes
+    -----
+    ``get_module(d, p)`` constructs a fresh module using ``input_size=d``,
+    ``output_size=p``, and the adapter parameters from ``get_params()``. Its
+    forward method maps float32 features of shape ``(n_samples, d)`` to
+    unconstrained distribution parameters of shape ``(n_samples, p)``.
+    Construction does not fit the module or move it to an estimator device;
+    :class:`SurvivalEstimator` moves the assembled model. Adapter instances
+    expose scikit-learn ``get_params`` and ``set_params``.
+    """
     @property
     @abstractmethod
     def module_class(self) -> type[Module]:
-        """Module constructor, supplied by subclasses as a class attribute."""
+        r"""Return the module constructor.
+
+        Returns
+        -------
+        type of torch.nn.Module
+            Constructor accepting feature and parameter widths and adapter options.
+        """
         raise NotImplementedError
 
     def get_module(self, input_size: int, output_size: int) -> Module:
+        r"""Build a fresh feature-to-parameter module.
+
+        Parameters
+        ----------
+        input_size : int
+            Number of input features.
+        output_size : int
+            Number of raw survival parameters.
+
+        Returns
+        -------
+        torch.nn.Module
+            Newly constructed module following the :class:`BaseInputAdapter` contract.
+        """
         return self.module_class(
             input_size=input_size, output_size=output_size, **self.get_params()
         )
@@ -94,6 +159,30 @@ class BaseInputAdapter(BaseEstimator, ABC):
 
 @dataclass
 class LinearFunctionInputAdapter(BaseInputAdapter):
+    r"""Build a fixed affine feature map.
+
+    Parameters
+    ----------
+    mode : {'identity', 'random'}, default='identity'
+        Use a rectangular identity matrix or uniform random weights.
+    multiplier : float, default=1.0
+        Multiply the weight matrix by this value.
+    shift : float, default=0.0
+        Add this scalar to every output.
+    use_first_n_feats : int, optional
+        Set weight rows after this many features to zero.
+    seed : int, optional
+        Seed the local PyTorch generator in random mode.
+
+    Notes
+    -----
+    Uses the construction contract in :class:`BaseInputAdapter`. The output
+    is ``X @ W + shift``; weights are buffers, not trainable parameters.
+
+    See Also
+    --------
+    survcraft.input_modules.LinearFunctionInputModule : Affine implementation.
+    """
     module_class = input_modules.LinearFunctionInputModule
 
     mode: Literal["identity", "random"] = "identity"
@@ -105,6 +194,31 @@ class LinearFunctionInputAdapter(BaseInputAdapter):
 
 @dataclass
 class FeedForwardNetAdapter(BaseInputAdapter):
+    r"""Build a trainable feed-forward feature map.
+
+    Parameters
+    ----------
+    hidden_sizes : sequence of int, default=[]
+        Hidden layer widths; the default has no hidden layers.
+    hidden_activation : callable, default=torch.nn.ReLU
+        Zero-argument constructor called for each hidden activation.
+    output_activation : callable, optional
+        Zero-argument constructor for an optional output activation.
+    batch_norm : bool, default=False
+        Add batch normalization before each hidden activation.
+    dropout : float, default=0.0
+        Dropout probability after each hidden activation.
+
+    Notes
+    -----
+    Uses the construction contract in :class:`BaseInputAdapter`. Output
+    values are raw parameters; distribution constraints are applied later
+    by the survival module.
+
+    See Also
+    --------
+    survcraft.input_modules.FeedForwardNet : Network implementation.
+    """
     module_class = input_modules.FeedForwardNet
 
     hidden_sizes: Sequence[int] = field(default_factory=list)
@@ -128,10 +242,37 @@ class FeedForwardNetAdapter(BaseInputAdapter):
 
 
 class BaseSurvivalAdapter(BaseEstimator, ABC):
+    r"""Construct survival modules, optionally using observed outcomes.
+
+    Attributes
+    ----------
+    module_class : type of survcraft.survival_modules.BaseSurvivalModule
+        Constructor supplied by concrete adapters.
+    param_funcs : dict of str to callable
+        Parameter transformations called as ``func(value, event, time)``.
+
+    Notes
+    -----
+    ``get_module`` validates paired outcome vectors, transforms constructor
+    parameters from ``get_params(deep=False)``, and creates a fresh module.
+    The input adapter uses its ``get_param_number()`` as the output width.
+    See :class:`survcraft.survival_modules.BaseSurvivalModule` for raw and
+    processed parameter shapes and prediction modes. Construction neither
+    fits the module nor moves it to a device. Outcomes are boolean event
+    indicators and finite nonnegative times; both may be omitted for
+    simulation. Outcome-dependent adapters then use their documented
+    fallbacks. Nested adapters are recursively constructed by ``param_funcs``.
+    """
     @property
     @abstractmethod
     def module_class(self) -> type[survival_modules.BaseSurvivalModule]:
-        """Module constructor, supplied by subclasses as a class attribute."""
+        r"""Return the survival module constructor.
+
+        Returns
+        -------
+        type of survcraft.survival_modules.BaseSurvivalModule
+            Constructor accepting transformed adapter parameters.
+        """
         raise NotImplementedError
 
     # functions to be applied to parameters for preprocessing before passing it to the torch module (for instance for arrays that needs to be converted to tensors or for derived modules that need to initialized their submodules)
@@ -142,6 +283,26 @@ class BaseSurvivalAdapter(BaseEstimator, ABC):
     def get_module(
         self, event: Optional[ArrayLike], time: Optional[ArrayLike]
     ) -> survival_modules.BaseSurvivalModule:
+        r"""Build a fresh survival module using optional outcomes.
+
+        Parameters
+        ----------
+        event : array-like of bool, shape (n_samples,), or None
+            True for observed events, False for right censoring.
+        time : array-like, shape (n_samples,), or None
+            Finite nonnegative observed event or censoring times.
+
+        Returns
+        -------
+        survcraft.survival_modules.BaseSurvivalModule
+            Module following the :class:`BaseSurvivalAdapter` construction contract.
+
+        Raises
+        ------
+        ValueError
+            If only one outcome vector is supplied, their shapes or dtypes are
+            invalid, or parameter preprocessing rejects an option.
+        """
         if (event is None) != (time is None):
             raise ValueError("event and time must both be supplied or both be None")
         if event is not None:
@@ -164,25 +325,82 @@ class BaseSurvivalAdapter(BaseEstimator, ABC):
 
 
 class ExponentialSurvivalAdapter(BaseSurvivalAdapter):
+    r"""Build a rate-parameterized exponential survival module.
+
+    Notes
+    -----
+    Uses the construction contract in :class:`BaseSurvivalAdapter` and the
+    parameterization and formulas in
+    :class:`survcraft.survival_modules.ExponentialSurvivalModule`.
+    """
     module_class = survival_modules.ExponentialSurvivalModule
 
 
 class WeibullSurvivalAdapter(BaseSurvivalAdapter):
+    r"""Build a Weibull survival module.
+
+    Notes
+    -----
+    Uses the construction contract in :class:`BaseSurvivalAdapter` and the
+    parameterization and formulas in
+    :class:`survcraft.survival_modules.WeibullSurvivalModule`.
+    """
     module_class = survival_modules.WeibullSurvivalModule
 
 
 class LogNormalSurvivalAdapter(BaseSurvivalAdapter):
+    r"""Build a log-normal survival module.
+
+    Notes
+    -----
+    Uses the construction contract in :class:`BaseSurvivalAdapter` and the
+    parameterization and formulas in
+    :class:`survcraft.survival_modules.LogNormalSurvivalModule`.
+    """
     module_class = survival_modules.LogNormalSurvivalModule
 
 class LevySurvivalAdapter(BaseSurvivalAdapter):
+    r"""Build a Lévy first-passage survival module.
+
+    Notes
+    -----
+    Uses the construction contract in :class:`BaseSurvivalAdapter` and the
+    parameterization and formulas in
+    :class:`survcraft.survival_modules.LevySurvivalModule`.
+    """
     module_class = survival_modules.LevySurvivalModule
     
 class InverseGaussianSurvivalAdapter(BaseSurvivalAdapter):
+    r"""Build a inverse-Gaussian first-passage survival module.
+
+    Notes
+    -----
+    Uses the construction contract in :class:`BaseSurvivalAdapter` and the
+    parameterization and formulas in
+    :class:`survcraft.survival_modules.InverseGaussianSurvivalModule`.
+    """
     module_class = survival_modules.InverseGaussianSurvivalModule
 
 
 @dataclass
 class FractalNoiseSurvivalAdapter(BaseSurvivalAdapter):
+    r"""Build a random interpolated survival profile for simulation.
+
+    Parameters
+    ----------
+    max_time : float, default=1.0
+        End of the interpolation grid; should be positive.
+    backbone_length : int, default=1
+        Number of random backbone points before the terminal zero.
+    seed : int, optional
+        Seed for Python's global random generator during construction.
+
+    Notes
+    -----
+    Uses :class:`BaseSurvivalAdapter`. This module has no trainable raw
+    parameters and uses NumPy interpolation; see the numerical and device
+    limitations in :class:`survcraft.survival_modules.FractalNoiseSurvivalModule`.
+    """
     max_time: float = 1.0
     backbone_length: int = 1
     seed: Optional[int] = None
@@ -192,6 +410,35 @@ class FractalNoiseSurvivalAdapter(BaseSurvivalAdapter):
 
 @dataclass
 class StepExpSurvivalAdapter(BaseSurvivalAdapter):
+    r"""Build a piecewise constant density with an exponential tail.
+
+    Parameters
+    ----------
+    breaks : int or array-like, default=10
+        Number of quantile breakpoints or an explicit zero-based, finite,
+        strictly increasing grid with at least two float32-distinct points.
+    trainable_breaks : bool, default=False
+        Optimize the positive interval lengths during training.
+
+    Raises
+    ------
+    ValueError
+        If the grid is invalid or fewer than two breaks can be derived.
+
+    Warnings
+    --------
+    UserWarning
+        If fewer unique quantile breaks are available than requested.
+
+    Notes
+    -----
+    Uses :class:`BaseSurvivalAdapter`. An integer ``b`` requests quantiles
+    ``arange(b) / b`` of observed event times; the first break is set to zero
+    and duplicates are removed. Without outcomes the grid is ``arange(b)/b``.
+    This describes a piecewise constant *density*, not a piecewise constant
+    hazard. See :class:`survcraft.survival_modules.StepExpSurvivalModule`
+    for formulas.
+    """
     breaks: Union[int, ArrayLike] = 10
     trainable_breaks: bool = False
 
@@ -201,6 +448,32 @@ class StepExpSurvivalAdapter(BaseSurvivalAdapter):
         event: Optional[numpy.ndarray],
         time: Optional[numpy.ndarray],
     ) -> Tensor:
+        r"""Convert an explicit grid or event quantiles to float32 breaks.
+
+        Parameters
+        ----------
+        breaks : int or array-like
+            Break specification described in :class:`StepExpSurvivalAdapter`.
+        event : numpy.ndarray of bool or None
+            Validated event indicators.
+        time : numpy.ndarray or None
+            Matching observed times.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_breaks,)
+            Zero-based, finite, strictly increasing grid on the CPU.
+
+        Raises
+        ------
+        ValueError
+            If breaks are invalid or observed events cannot provide two breaks.
+
+        Notes
+        -----
+        When outcomes are supplied, ``event`` and ``time`` must both be present.
+        Duplicate quantiles are removed with a warning if the count decreases.
+        """
         if isinstance(breaks, (int, numpy.integer)):
             if breaks < 2:
                 raise ValueError("breaks count must be at least two")
@@ -229,6 +502,22 @@ class StepExpSurvivalAdapter(BaseSurvivalAdapter):
 @dataclass
 class DerivedSurvivalAdapter(BaseSurvivalAdapter):
     # abstract class for common behaviour between PH and AFT adapters
+    r"""Share baseline construction for transformed survival models.
+
+    Parameters
+    ----------
+    baseline : BaseSurvivalAdapter, optional
+        Baseline distribution factory; defaults to a new StepExpSurvivalAdapter.
+    baseline_params : array-like, shape (n_baseline_params,), optional
+        Fixed raw baseline parameters, converted to a float32 tensor. If None,
+        the module creates trainable baseline parameters.
+
+    Notes
+    -----
+    Abstract factory using :class:`BaseSurvivalAdapter`. Its concrete
+    subclasses supply ``module_class``; nested baselines receive the same
+    outcome vectors.
+    """
     baseline: BaseSurvivalAdapter = field(default_factory=StepExpSurvivalAdapter)
     baseline_params: Optional[ArrayLike] = None
 
@@ -241,15 +530,68 @@ class DerivedSurvivalAdapter(BaseSurvivalAdapter):
 
 @dataclass
 class ProportionalHazardSurvivalAdapter(DerivedSurvivalAdapter):
+    r"""Build a proportional hazards survival module.
+
+    Parameters
+    ----------
+    baseline : BaseSurvivalAdapter, optional
+        Baseline distribution factory; defaults to a new StepExpSurvivalAdapter.
+    baseline_params : array-like, shape (n_baseline_params,), optional
+        Fixed raw baseline parameters, converted to a float32 tensor. If None,
+        the module creates trainable baseline parameters.
+
+    Notes
+    -----
+    Includes the inherited :class:`DerivedSurvivalAdapter` options and
+    uses :class:`BaseSurvivalAdapter` construction. See
+    :class:`survcraft.survival_modules.ProportionalHazardSurvivalModule` for
+    formulas and the handling of fixed baseline tensors.
+    """
     module_class = survival_modules.ProportionalHazardSurvivalModule
 
 @dataclass
 class AcceleratedFailureTimeSurvivalAdapter(DerivedSurvivalAdapter):
+    r"""Build a time-scaled survival module.
+
+    Parameters
+    ----------
+    baseline : BaseSurvivalAdapter, optional
+        Baseline distribution factory; defaults to a new StepExpSurvivalAdapter.
+    baseline_params : array-like, shape (n_baseline_params,), optional
+        Fixed raw baseline parameters, converted to a float32 tensor. If None,
+        the module creates trainable baseline parameters.
+
+    Notes
+    -----
+    Includes the inherited :class:`DerivedSurvivalAdapter` options and
+    uses :class:`BaseSurvivalAdapter` construction. See
+    :class:`survcraft.survival_modules.AcceleratedFailureTimeSurvivalModule` for
+    formulas and the handling of fixed baseline tensors.
+    """
     module_class = survival_modules.AcceleratedFailureTimeSurvivalModule
 
 
 @dataclass
 class MixtureSurvivalAdapter(BaseSurvivalAdapter):
+    r"""Build a mixture with feature-dependent weights and component parameters.
+
+    Parameters
+    ----------
+    baselines : sequence of BaseSurvivalAdapter, optional
+        At least two component factories; defaults to three independent
+        StepExpSurvivalAdapter instances.
+
+    Raises
+    ------
+    ValueError
+        If fewer than two baselines are supplied.
+
+    Notes
+    -----
+    Uses :class:`BaseSurvivalAdapter`. Every component receives the same
+    outcomes. See :class:`survcraft.survival_modules.MixtureSurvivalModule`
+    for formulas and raw parameter ordering.
+    """
     baselines: Sequence[BaseSurvivalAdapter] = field(
         default_factory=lambda: [StepExpSurvivalAdapter() for _ in range(3)]
     )
@@ -261,6 +603,27 @@ class MixtureSurvivalAdapter(BaseSurvivalAdapter):
         event: Optional[numpy.ndarray],
         time: Optional[numpy.ndarray],
     ) -> list[survival_modules.BaseSurvivalModule]:
+        r"""Construct each mixture component from the shared outcomes.
+
+        Parameters
+        ----------
+        baselines : sequence of BaseSurvivalAdapter
+            At least two component factories.
+        event : numpy.ndarray of bool or None
+            Event indicators supplied to every factory.
+        time : numpy.ndarray or None
+            Matching observed times.
+
+        Returns
+        -------
+        list of survcraft.survival_modules.BaseSurvivalModule
+            Fresh component modules in the supplied order.
+
+        Raises
+        ------
+        ValueError
+            If fewer than two baselines are supplied or construction fails.
+        """
         if len(baselines) < 2:
             raise ValueError("baselines must be a sequence of at least two survival adapter instances")
         return [
@@ -273,12 +636,51 @@ class MixtureSurvivalAdapter(BaseSurvivalAdapter):
     }
 
 def shape2str(x: Union[Tensor, numpy.ndarray]) -> str:
+    r"""Format tensor or array dimensions for diagnostics.
+
+    Parameters
+    ----------
+    x : torch.Tensor or numpy.ndarray
+        Object whose shape is formatted.
+
+    Returns
+    -------
+    str
+        Dimensions separated by ``x``; empty for a scalar.
+    """
     return 'x'.join(map(str, x.shape))
 
 
 check_divergence_values: tuple[CheckDivergence, ...] = "warn", "raise", "no"
 class TorchModel(torch.nn.Module):
-    """Simple torch module that applies the input and survival module together."""
+    r"""Compose a feature map and a survival distribution module.
+
+    Parameters
+    ----------
+    input_module : torch.nn.Module
+        Feature-to-raw-parameter map following :class:`BaseInputAdapter`.
+    survival_module : survcraft.survival_modules.BaseSurvivalModule
+        Distribution module following :class:`BaseSurvivalAdapter`.
+    check_divergence : {"raise", "warn", "no"}, default="raise"
+        Policy for non-finite raw parameters and predictions.
+
+    Attributes
+    ----------
+    input_module : torch.nn.Module
+        Registered feature map.
+    survival_module : survcraft.survival_modules.BaseSurvivalModule
+        Registered distribution module.
+
+    Raises
+    ------
+    ValueError
+        If the divergence policy is unknown.
+
+    Notes
+    -----
+    Calling the model uses the prediction modes and shapes documented in
+    :class:`SurvivalEstimator`, returning tensors on the model device.
+    """
 
     def __init__(
         self,
@@ -286,6 +688,12 @@ class TorchModel(torch.nn.Module):
         survival_module: survival_modules.BaseSurvivalModule,
         check_divergence: CheckDivergence = "raise",
     ) -> None:
+        r"""Initialize the two registered modules and divergence policy.
+
+        See Also
+        --------
+        TorchModel : Constructor parameters and module contracts.
+        """
         super().__init__()
         self.input_module = input_module
         self.survival_module = survival_module
@@ -294,9 +702,37 @@ class TorchModel(torch.nn.Module):
         self.check_divergence = check_divergence
 
     def get_raw_params(self, x: Tensor) -> Tensor:
+        r"""Compute unconstrained distribution parameters.
+
+        Parameters
+        ----------
+        x : torch.Tensor, shape (n_samples, n_features)
+            Features on the model device.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_samples, n_raw_params)
+            Feature-map output; gradients remain enabled by the caller.
+        """
         return self.input_module(x)
 
     def get_processed_params(self, x: Tensor) -> dict[str, Tensor]:
+        r"""Compute named, transformed distribution parameters.
+
+        Parameters
+        ----------
+        x : torch.Tensor, shape (n_samples, n_features)
+            Features on the model device.
+
+        Returns
+        -------
+        dict of str to torch.Tensor
+            Parameter groups with shape ``(n_samples, group_width)``.
+
+        Notes
+        -----
+        This inspection method bypasses the divergence checks in ``forward``.
+        """
         return self.survival_module.preprocess_params(self.input_module(x))
 
     def _check_tensor(
@@ -306,6 +742,34 @@ class TorchModel(torch.nn.Module):
         times: Optional[Tensor] = None,
         context: Mapping[str, Any] = {},
     ) -> None:
+        r"""Apply the configured policy to non-finite tensor values.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Tensor to check.
+        name : str
+            Tensor description for diagnostics.
+        times : torch.Tensor, optional
+            Scalar or vector of associated prediction times.
+        context : mapping, optional
+            Additional diagnostic values attached to a raised exception.
+
+        Returns
+        -------
+        None
+            Returns after checking or when checks are disabled.
+
+        Raises
+        ------
+        ValueError
+            If non-finite values occur under the raise policy.
+
+        Notes
+        -----
+        The warn policy emits a warning. Raised exceptions include a dict
+        of tensor values and context as their second argument.
+        """
         if self.check_divergence != "no":
             x_fail = ~x.isfinite()
             if x_fail.any():
@@ -330,6 +794,32 @@ class TorchModel(torch.nn.Module):
     def forward(
         self, mode: str, x: Tensor, times: Optional[Tensor] = None
     ) -> TensorPrediction:
+        r"""Predict a distribution quantity and check for non-finite values.
+
+        Parameters
+        ----------
+        mode : str
+            Prediction mode from :class:`SurvivalEstimator`.
+        x : torch.Tensor, shape (n_samples, n_features)
+            Features on the model device.
+        times : torch.Tensor, scalar or shape (n_times,), optional
+            Shared evaluation times for time-dependent modes.
+
+        Returns
+        -------
+        torch.Tensor or dict of str to torch.Tensor
+            Output shapes follow :meth:`SurvivalEstimator.predict`.
+
+        Raises
+        ------
+        ValueError
+            If a value is non-finite and ``check_divergence="raise"``, or the
+            survival module rejects the mode or parameter width.
+
+        See Also
+        --------
+        survcraft.survival_modules.BaseSurvivalModule.forward : Mode validation.
+        """
         params = self.input_module(x)
         self._check_tensor(params, name="raw params") # times not needed since params are not indexed by times
 
@@ -344,6 +834,22 @@ class TorchModel(torch.nn.Module):
 
 # decorator to add context to exceptions in SurvivalEstimator methods
 def add_exception_context(method: Method) -> Method:
+    r"""Annotate estimator exceptions with their method and estimator.
+
+    Parameters
+    ----------
+    method : callable
+        Estimator method to wrap.
+
+    Returns
+    -------
+    callable
+        Wrapped method preserving the original signature and docstring.
+
+    Notes
+    -----
+    Exception notes are added on Python 3.11 and later.
+    """
     @functools.wraps(method)
     def wrapper(self: SurvivalEstimator, *args: Any, **kwargs: Any) -> Any:
         try:
@@ -365,6 +871,66 @@ def add_exception_context(method: Method) -> Method:
 
 @dataclass
 class SurvivalEstimator(BaseEstimator):
+    r"""Define shared data, prediction, device, and model-state contracts.
+
+    Parameters
+    ----------
+    input : BaseInputAdapter, optional
+        Feature-map factory; the base estimator defaults to None.
+    survival : BaseSurvivalAdapter, optional
+        Distribution factory; the base estimator defaults to None.
+    loss : survcraft.loss_modules.BaseSurvivalLoss, optional
+        Training objective; the base estimator defaults to None.
+    device : str or sequence of str, default='cpu'
+        PyTorch device or nonempty list of candidate devices. One candidate
+        is randomly chosen and cached on first use, not distributed across.
+    verbose : int, default=0
+        Training output level: 0 is quiet, 1 periodic, 2 per epoch, 3 per batch.
+    check_divergence : {'raise', 'warn', 'no'}, default='raise'
+        Policy for non-finite raw parameters and predictions.
+
+    Attributes
+    ----------
+    model_ : TorchModel
+        Assembled model, present after predictor initialization or the first
+        simulator prediction. Its presence alone does not prove successful training.
+    device_ : str
+        Cached device, created on first device use.
+
+    Notes
+    -----
+    Features are dense numeric arrays of shape ``(n_samples, n_features)``.
+    The caller encodes categories and handles missing values; no feature
+    scaling or imputation is performed. Features and times are copied to
+    float32 tensors; events use boolean tensors. Direct tensor callers must
+    put model, losses, and data on compatible devices.
+
+    Predictor targets are one-dimensional NumPy structured arrays with
+    exactly two scalar fields: boolean event first, finite nonnegative time
+    second. Field names are arbitrary. True means an observed event; False
+    means right censoring. ``train`` accepts separate outcome vectors.
+
+    Time-dependent modes are ``failure``, ``survival``, ``density``, and
+    ``hazard``. A shared time vector gives ``(n_samples, n_times)`` outputs;
+    a scalar gives ``(n_samples,)``. ``expected_time``, ``median_time``, and
+    ``risk`` take no times and give ``(n_samples,)``. Higher risk means
+    earlier events. Not every distribution implements every summary mode.
+    ``params`` takes no times and returns named transformed parameter arrays
+    of shape ``(n_samples, group_width)``. All array predictions return to CPU.
+
+    The base ``fit`` is a no-op and does not create ``model_``. Predictors
+    require ``fit`` or ``train`` before prediction; simulators initialize
+    lazily. Module construction creates fresh input and survival modules
+    and moves the assembled model to ``device_``. Changing estimator options
+    does not rebuild an existing model automatically.
+
+    See Also
+    --------
+    SurvivalPredictor : Train a model from censored outcomes.
+    SurvivalSimulator : Sample outcomes from a lazily constructed model.
+    BaseInputAdapter : Feature-map construction.
+    BaseSurvivalAdapter : Distribution construction.
+    """
     input: Optional[BaseInputAdapter] = None
     survival: Optional[BaseSurvivalAdapter] = None
     loss: Optional[loss_modules.BaseSurvivalLoss] = None
@@ -375,6 +941,18 @@ class SurvivalEstimator(BaseEstimator):
     # precision: torch.dtype = torch.float32
 
     def _get_device(self) -> str:
+        r"""Select and cache one configured device.
+
+        Returns
+        -------
+        str
+            Existing device_ or a newly selected device.
+
+        Notes
+        -----
+        A sequence is sampled using Python random.choice once. Changing the
+        device option later does not clear the cached choice.
+        """
         try:
             return self.device_
         except AttributeError:
@@ -393,7 +971,27 @@ class SurvivalEstimator(BaseEstimator):
         dtype: Optional[torch.dtype] = torch.float32,
         device: Optional[Union[str, torch.device]] = None,
     ) -> Tensor:
-        """Convert array to tensor"""
+        r"""Copy array-like values into a tensor on the requested device.
+
+        Parameters
+        ----------
+        a : array-like
+            Numeric values to copy.
+        dtype : torch.dtype or None, default=torch.float32
+            Requested dtype; None lets PyTorch infer it.
+        device : str or torch.device, optional
+            Target device; defaults to the cached estimator device.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor containing the copied values.
+
+        Notes
+        -----
+        Retries a ValueError using a.copy(), accommodating structured-target
+        field views whose strides PyTorch cannot convert directly.
+        """
         # if dtype is None:
         #    dtype = self.precision
         if device is None:
@@ -414,6 +1012,37 @@ class SurvivalEstimator(BaseEstimator):
         device: Optional[Union[str, torch.device]] = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         # sksurv seems to always put event before time, we follow the convention
+        r"""Check basic dataset invariants and copy features and outcomes.
+
+        Parameters
+        ----------
+        X : numpy.ndarray, shape (n_samples, n_features)
+            Numeric feature matrix.
+        event : numpy.ndarray of bool, shape (n_samples,)
+            Observed-event indicators.
+        time : numpy.ndarray, shape (n_samples,), optional
+            Required observed times; the None path is unimplemented.
+        device : str or torch.device, optional
+            Tensor device; defaults to the estimator device.
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            Float32 features, boolean events, and float32 times.
+
+        Raises
+        ------
+        ValueError
+            If the minimum time is negative.
+        AssertionError
+            If counts differ, events are not boolean, time is omitted, or the
+            nonnegative-time assertion fails.
+
+        Notes
+        -----
+        Warns for zero times. This helper does not fully validate feature
+        shape or time finiteness; fit performs separate structured-target checks.
+        """
         assert X.shape[0] == event.shape[0]
         if time is None:
             assert False, "implement scikit-survival style structured array"
@@ -442,6 +1071,27 @@ class SurvivalEstimator(BaseEstimator):
         event: Optional[ArrayLike] = None,
         time: Optional[ArrayLike] = None,
     ) -> None:
+        r"""Construct and move a fresh model from adapter factories.
+
+        Parameters
+        ----------
+        X : numpy.ndarray, shape (n_samples, n_features)
+            Features used to infer input width.
+        event : array-like of bool, optional
+            Observed events for outcome-dependent adapter construction.
+        time : array-like, optional
+            Matching observed times.
+
+        Returns
+        -------
+        None
+            Assigns model_ and selects device_ if needed.
+
+        Notes
+        -----
+        The input output width comes from survival_module.get_param_number().
+        Requires input and survival adapters to be configured.
+        """
         survival_module = self.survival.get_module(
             event=event,
             time=time,
@@ -458,11 +1108,48 @@ class SurvivalEstimator(BaseEstimator):
     def fit(self, X: numpy.ndarray, y: numpy.ndarray) -> SurvivalEstimator:
         # warnings.warn(f"Fit of {self.__class__.__name__} does nothing")
         # print(f"Fit of {self.__class__.__name__} does nothing") # maybe use a warning
+        r"""Return this base estimator without constructing or training a model.
+
+        Parameters
+        ----------
+        X : numpy.ndarray
+            Unused feature data.
+        y : numpy.ndarray
+            Unused target data.
+
+        Returns
+        -------
+        SurvivalEstimator
+            This estimator unchanged.
+
+        See Also
+        --------
+        SurvivalPredictor.fit : Training implementation.
+        """
         return self
 
     def predict_survival(
         self, X: numpy.ndarray, times: Optional[ArrayLike] = None
     ) -> numpy.ndarray:
+        r"""Evaluate survival probabilities at shared times.
+
+        Parameters
+        ----------
+        X : numpy.ndarray, shape (n_samples, n_features)
+            Numeric feature matrix.
+        times : array-like, scalar or shape (n_times,), optional
+            Required evaluation times despite the default None.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape ``(n_samples, n_times)`` for a vector or ``(n_samples,)`` for a
+            scalar.
+
+        See Also
+        --------
+        SurvivalEstimator.predict : Prediction contract and exceptions.
+        """
         return cast(numpy.ndarray, self.predict(mode="survival", X=X, times=times))
 
     @add_exception_context
@@ -472,6 +1159,45 @@ class SurvivalEstimator(BaseEstimator):
         X: numpy.ndarray,
         times: Optional[ArrayLike] = None,
     ) -> ArrayPrediction:
+        r"""Evaluate a distribution quantity without tracking gradients.
+
+        Parameters
+        ----------
+        mode : {'failure', 'survival', 'density', 'hazard', 'expected_time', 'median_time', 'risk', 'params'}
+            Distribution quantity to evaluate; see :class:`SurvivalEstimator`.
+        X : numpy.ndarray, shape (n_samples, n_features)
+            Numeric features following the shared estimator contract.
+        times : array-like, scalar or shape (n_times,), optional
+            Shared nonnegative evaluation times; required for time-dependent
+            modes and omitted for summaries and parameters.
+
+        Returns
+        -------
+        numpy.ndarray or dict of str to numpy.ndarray
+            A matrix ``(n_samples, n_times)`` for a time vector, a vector
+            ``(n_samples,)`` for a scalar time or summary, or named parameter
+            arrays ``(n_samples, group_width)`` for ``params``.
+
+        Raises
+        ------
+        AttributeError
+            If ``model_`` has not been initialized.
+        TypeError
+            If mode is not a string.
+        ValueError
+            If mode, parameter width, or output shape is invalid, or a non-finite
+            output violates the divergence policy.
+        AssertionError
+            If times are missing, have more than one dimension, or are supplied
+            for a summary mode.
+        NotImplementedError
+            If the selected distribution does not implement the mode.
+
+        Notes
+        -----
+        Puts ``model_`` in evaluation mode and returns CPU NumPy arrays.
+        See :class:`SurvivalEstimator` for precision and device handling.
+        """
         self.model_.eval()
         with torch.no_grad():
             result = self.model_(
@@ -485,6 +1211,29 @@ class SurvivalEstimator(BaseEstimator):
             return result.detach().cpu().numpy()
 
     def plot(self, X: numpy.ndarray, max_time: Optional[float] = None) -> None:
+        r"""Create plots of failure, survival, density, and hazard.
+
+        Parameters
+        ----------
+        X : numpy.ndarray, shape (n_samples, n_features)
+            Samples whose distributions are plotted.
+        max_time : float, optional
+            Final evaluation time, inferred from survival curves when omitted.
+
+        Returns
+        -------
+        None
+            The figure is available through matplotlib.pyplot.
+
+        Notes
+        -----
+        Requires the optional plotting dependencies. The model must support
+        all four time-dependent modes.
+
+        See Also
+        --------
+        survcraft.plotting.plot_outputs : Plot implementation.
+        """
         from .plotting import plot_outputs
 
         plot_outputs(self, X, max_time=max_time)
@@ -493,6 +1242,91 @@ class SurvivalEstimator(BaseEstimator):
 
 @dataclass
 class SurvivalPredictor(SurvivalEstimator):
+    r"""Fit a neural survival model to right-censored outcomes with Adam.
+
+    Parameters
+    ----------
+    input : BaseInputAdapter, optional
+        Feature-map factory; defaults to a new FeedForwardNetAdapter.
+    survival : BaseSurvivalAdapter, optional
+        Distribution factory; defaults to a new ExponentialSurvivalAdapter.
+    loss : survcraft.loss_modules.BaseSurvivalLoss, optional
+        Training objective; defaults to a new BrierLoss.
+    device : str or sequence of str, default='cpu'
+        PyTorch device or nonempty list of candidate devices. One candidate
+        is randomly chosen and cached on first use, not distributed across.
+    verbose : int, default=0
+        Training output level: 0 is quiet, 1 periodic, 2 per epoch, 3 per batch.
+    check_divergence : {'raise', 'warn', 'no'}, default='raise'
+        Policy for non-finite raw parameters and predictions.
+    batch_size : int, default=256
+        Training and validation mini-batch size.
+    learning_rate : float, default=0.005
+        Adam learning rate.
+    weight_decay : float, default=0.0
+        Adam weight decay.
+    epochs : int, default=10
+        Maximum epochs per training call.
+    warm_start : bool, default=False
+        Reuse model weights in fit; optimizer state is recreated each call.
+    early_stopping : bool, default=False
+        Hold out validation data and restore the best model state.
+    validation_ratio : float, default=0.1
+        Fraction held out when early stopping is enabled.
+    early_stopping_patience : int, default=10
+        Epochs without improvement before stopping.
+    data_loader_num_workers : int, default=0
+        Number of PyTorch data loader worker processes.
+    preload_data : bool, default=False
+        Store training tensors on the selected device before batching.
+    gradient_clipping : bool, default=False
+        Clip parameter gradient norm to 1.0 before each optimizer step.
+    history : bool, default=False
+        Record batch losses and optional test losses for each completed epoch.
+
+    Attributes
+    ----------
+    model_ : TorchModel
+        Assembled model, present after predictor initialization or the first
+        simulator prediction. Its presence alone does not prove successful training.
+    device_ : str
+        Cached device, created on first device use.
+    train_history_ : list of tuple
+        Each recorded epoch contains a NumPy vector of usable batch losses
+        and a dict of test loss names to Python floats. Reset when the model
+        is rebuilt; populated only when history=True.
+
+    Notes
+    -----
+    Uses the shared :class:`SurvivalEstimator` contracts and all its
+    inherited constructor options. For each usable batch :math:`B`, Adam
+    minimizes :math:`L_B = L(M_\theta, X_B, e_B, t_B)`. The selected
+    :class:`survcraft.loss_modules.BaseSurvivalLoss` defines the objective
+    and reduction. Risk sets and classification time grids use the current
+    batch, so batch size can change the objective. Batches without observed
+    events or with non-finite scalar losses are skipped; an epoch with no
+    usable batches raises :class:`FailedConvergence`.
+
+    Early stopping uses a random, unstratified split and the unweighted mean
+    of validation batch losses. Test data are evaluated for history only;
+    they do not supply the early-stopping validation set. Random network
+    initialization, shuffling, and validation splitting are not seeded by
+    this estimator. Loss modules are not automatically moved to ``device_``.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> X = np.array([[0.0], [1.0], [2.0]], dtype=np.float32)
+    >>> y = np.array([(True, 1.0), (False, 2.0), (True, 3.0)],
+    ...              dtype=[("event", "?"), ("time", "f4")])
+    >>> predictor = SurvivalPredictor(epochs=1).fit(X, y)
+    >>> predictor.predict_survival(X, [0.5, 1.0]).shape
+    (3, 2)
+
+    See Also
+    --------
+    survcraft.loss_modules.BaseSurvivalLoss : Scalar objective contract and composition.
+    """
     input: BaseInputAdapter = field(default_factory=FeedForwardNetAdapter)
     survival: BaseSurvivalAdapter = field(default_factory=ExponentialSurvivalAdapter)
     loss: loss_modules.BaseSurvivalLoss = field(default_factory=loss_modules.BrierLoss)
@@ -517,6 +1351,25 @@ class SurvivalPredictor(SurvivalEstimator):
     def _extract_target(
         y: numpy.ndarray, name: str
     ) -> tuple[numpy.ndarray, numpy.ndarray]:
+        r"""Validate and copy a positional structured survival target.
+
+        Parameters
+        ----------
+        y : numpy.ndarray, shape (n_samples,)
+            Exactly two scalar fields: boolean event, then real numeric time.
+        name : str
+            Argument name used in diagnostics.
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            Copies of the event and time fields.
+
+        Raises
+        ------
+        ValueError
+            If the target format is invalid or times are non-finite or negative.
+        """
         if not isinstance(y, numpy.ndarray) or y.ndim != 1:
             raise ValueError(f"{name} must be a one-dimensional NumPy structured array")
         names = y.dtype.names
@@ -538,6 +1391,38 @@ class SurvivalPredictor(SurvivalEstimator):
         X_test: Optional[numpy.ndarray] = None,
         y_test: Optional[numpy.ndarray] = None,
     ) -> SurvivalPredictor:
+        r"""Train using a structured array of event and censoring times.
+
+        Parameters
+        ----------
+        X : numpy.ndarray, shape (n_samples, n_features)
+            Numeric features following :class:`SurvivalEstimator`.
+        y : numpy.ndarray, shape (n_samples,)
+            Structured target with boolean event first and numeric time second;
+            field names are arbitrary. Times must be finite and nonnegative.
+        X_test : numpy.ndarray, optional
+            Features for optional test-loss history.
+        y_test : numpy.ndarray, optional
+            Matching structured test outcomes. Both test arguments are needed;
+            supplying only one currently leaves test evaluation disabled.
+
+        Returns
+        -------
+        SurvivalPredictor
+            This estimator after training.
+
+        Raises
+        ------
+        ValueError
+            If a supplied structured target violates the target contract.
+        FailedConvergence
+            If an epoch has no usable training batches.
+
+        Notes
+        -----
+        Uses the constructor warm_start option. Test data do not control early
+        stopping. See :meth:`train` for the lower-level training interface.
+        """
         event, time = self._extract_target(y, "y")
         train_kwargs = {
             'X': X,
@@ -567,6 +1452,48 @@ class SurvivalPredictor(SurvivalEstimator):
         test_data: Optional[tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]] = None,
         test_losses: Optional[Sequence[loss_modules.BaseSurvivalLoss]] = None,
     ) -> None:
+        r"""Train with separate event and time vectors.
+
+        Parameters
+        ----------
+        X : numpy.ndarray, shape (n_samples, n_features)
+            Numeric feature matrix.
+        event : numpy.ndarray of bool, shape (n_samples,)
+            True for observed events, False for right censoring.
+        time : numpy.ndarray, shape (n_samples,)
+            Finite nonnegative event or censoring times. Zero times trigger a
+            warning because some distributions are singular there.
+        warm_start : bool, default=False
+            Reuse existing model weights if present. Overrides the constructor
+            option for this call; optimizer state is always recreated.
+        test_data : tuple of numpy.ndarray, optional
+            ``(X_test, event_test, time_test)`` for test-loss history.
+        test_losses : sequence of survcraft.loss_modules.BaseSurvivalLoss, optional
+            Test objectives; defaults to the training loss. Recorded by class
+            name, so duplicate classes overwrite earlier entries.
+
+        Returns
+        -------
+        None
+            Updates model_ and, if requested, train_history_.
+
+        Raises
+        ------
+        ValueError
+            If times are negative, module construction fails, or prediction
+            divergence violates the policy.
+        AssertionError
+            If sample counts do not match or event dtype is not boolean.
+        FailedConvergence
+            If every training batch in an epoch is skipped.
+
+        Notes
+        -----
+        Uses the algorithm and batching behavior in :class:`SurvivalPredictor`.
+        This lower-level entry point does not perform the full structured-target
+        validation of :meth:`fit`. Move losses with buffers to the model device
+        before training. Non-finite validation losses are not filtered.
+        """
         if not hasattr(self, "model_") or not warm_start:
             self._init_model(X, event, time)
             self.train_history_ = []
@@ -727,7 +1654,33 @@ class SurvivalPredictor(SurvivalEstimator):
 
     
     def get_distribution_params(self, X: numpy.ndarray) -> dict[str, Tensor]:
-        """Get the distribution parameters for given input data."""
+        r"""Inspect named distribution parameters as device-resident tensors.
+
+        Parameters
+        ----------
+        X : numpy.ndarray, shape (n_samples, n_features)
+            Numeric feature matrix.
+
+        Returns
+        -------
+        dict of str to torch.Tensor
+            Transformed parameter groups of shape ``(n_samples, group_width)``
+            on device_, computed without gradients.
+
+        Raises
+        ------
+        RuntimeError
+            If model_ has not been initialized.
+
+        Notes
+        -----
+        Sets evaluation mode. Unlike ``predict("params", X)``, this returns
+        PyTorch tensors and bypasses the divergence checks in TorchModel.forward.
+
+        See Also
+        --------
+        SurvivalEstimator.predict : NumPy parameter inspection.
+        """
         if not hasattr(self, "model_"):
             raise RuntimeError("Model is not trained. Call 'train' before using this method.")
         
@@ -740,6 +1693,55 @@ class SurvivalPredictor(SurvivalEstimator):
 
 @dataclass
 class SurvivalSimulator(SurvivalEstimator):
+    r"""Sample discretized right-censored outcomes from a fixed survival model.
+
+    Parameters
+    ----------
+    input : BaseInputAdapter, optional
+        Feature-map factory; defaults to a new LinearFunctionInputAdapter.
+    survival : BaseSurvivalAdapter, optional
+        Distribution factory; defaults to a new ExponentialSurvivalAdapter.
+    loss : survcraft.loss_modules.BaseSurvivalLoss, optional
+        Inherited option, unused by simulation; defaults to None.
+    device : str or sequence of str, default='cpu'
+        PyTorch device or nonempty list of candidate devices. One candidate
+        is randomly chosen and cached on first use, not distributed across.
+    verbose : int, default=0
+        Training output level: 0 is quiet, 1 periodic, 2 per epoch, 3 per batch.
+    check_divergence : {'raise', 'warn', 'no'}, default='raise'
+        Policy for non-finite raw parameters and predictions.
+
+    Attributes
+    ----------
+    model_ : TorchModel
+        Assembled model, present after predictor initialization or the first
+        simulator prediction. Its presence alone does not prove successful training.
+    device_ : str
+        Cached device, created on first device use.
+
+    Notes
+    -----
+    Uses all inherited options and contracts in :class:`SurvivalEstimator`.
+    The first prediction or simulation builds the model without outcomes.
+    The inherited ``fit`` is a no-op. Later calls reuse the model, requiring
+    the same feature width; changing adapter options does not rebuild it.
+
+    For a zero-based grid :math:`t_0,\ldots,t_{m-1}`, sampling uses
+    :math:`p_j = F(t_{j+1})-F(t_j)` for :math:`j<m-1`, and
+    :math:`p_c = 1-\sum_j p_j`. Probabilities are clipped to [0, 1] and
+    renormalized. An event is placed at its interval midpoint; the last
+    category is censoring at :math:`t_{m-1}`. This is a grid approximation,
+    not continuous inverse-CDF sampling. When :math:`F(0)>0`, that initial
+    mass is included in censoring rather than the first interval.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> simulator = SurvivalSimulator()
+    >>> y = simulator.simulate(np.ones((3, 1)), [0.0, 1.0, 2.0], seed=0)
+    >>> y.dtype.names
+    ('event', 'time')
+    """
     input: BaseInputAdapter = field(default_factory=LinearFunctionInputAdapter)
     survival: BaseSurvivalAdapter = field(default_factory=ExponentialSurvivalAdapter)
     # precision: torch.dtype = torch.float64
@@ -752,6 +1754,30 @@ class SurvivalSimulator(SurvivalEstimator):
     ) -> ArrayPrediction:
         # in simulator
         # assert isinstance(mode, str)
+        r"""Initialize the simulation model if needed, then predict.
+
+        Parameters
+        ----------
+        mode : {'failure', 'survival', 'density', 'hazard', 'expected_time', 'median_time', 'risk', 'params'}
+            Distribution quantity to evaluate; see :class:`SurvivalEstimator`.
+        X : numpy.ndarray, shape (n_samples, n_features)
+            Numeric features following the shared estimator contract.
+        times : array-like, scalar or shape (n_times,), optional
+            Shared nonnegative evaluation times; required for time-dependent
+            modes and omitted for summaries and parameters.
+
+        Returns
+        -------
+        numpy.ndarray or dict of str to numpy.ndarray
+            A matrix ``(n_samples, n_times)`` for a time vector, a vector
+            ``(n_samples,)`` for a scalar time or summary, or named parameter
+            arrays ``(n_samples, group_width)`` for ``params``.
+
+        Notes
+        -----
+        Uses :meth:`SurvivalEstimator.predict` and its mode validation.
+        Initialization uses no observed outcomes and caches model_ on first use.
+        """
         if not hasattr(self, "model_"):
             self._init_model(X, None, None)
 
@@ -763,38 +1789,36 @@ class SurvivalSimulator(SurvivalEstimator):
         times: ArrayLike,
         seed: Optional[int] = None,
     ) -> numpy.ndarray:
-        """Sample event times on a grid, with censoring at its final point.
+        r"""Sample event times on a grid with censoring at its final point.
 
         Parameters
         ----------
-        X : numpy.ndarray
-            Feature matrix with one row per sample.
-        times : array-like
-            Required one-dimensional numeric grid with at least two finite,
-            nonnegative points, starting at zero and strictly increasing.
-            Finiteness and ordering must also hold after float32 conversion,
-            the precision used for prediction and returned times.
+        X : numpy.ndarray, shape (n_samples, n_features)
+            Numeric features following :class:`SurvivalEstimator`.
+        times : array-like, shape (n_times,)
+            At least two finite nonnegative points starting at zero and strictly
+            increasing, including after float32 conversion.
         seed : int, optional
-            Seed for event sampling; does not seed model initialization.
+            Seed for the local NumPy sampling generator; does not seed model
+            initialization or random input weights.
 
         Returns
         -------
-        numpy.ndarray
-            Structured array with boolean ``event`` and float32 ``time`` fields.
-            Events in each grid interval are placed at its midpoint. Samples
-            surviving the final grid point are censored at that point.
+        numpy.ndarray, shape (n_samples,)
+            Structured array with boolean event and float32 time fields. Events
+            occur at interval midpoints; censoring occurs at the final grid point.
 
         Raises
         ------
         ValueError
-            If the time grid is missing or violates the grid requirements.
+            If the grid is invalid or model prediction fails.
 
         Notes
         -----
-        For consecutive grid points, interval probability is the difference
-        between their predicted failure probabilities. The remaining probability
-        is assigned to censoring at the final point. Starting at zero includes
-        the initial event probability in the first interval.
+        Uses the probability formulas in :class:`SurvivalSimulator`. Negative
+        CDF increments print diagnostics and are clipped before normalization;
+        this can hide a nonmonotone failure curve. Initial mass F(0) is not
+        sampled as an event.
         """
         times = _validate_time_grid(times, name="times")
         if not hasattr(self, "model_"):
@@ -856,4 +1880,10 @@ class SurvivalSimulator(SurvivalEstimator):
         return y
 
 class FailedConvergence(Exception):
+    r"""Signal that a training epoch has no usable batches.
+
+    See Also
+    --------
+    SurvivalPredictor.train : Skipped-batch handling.
+    """
     pass
