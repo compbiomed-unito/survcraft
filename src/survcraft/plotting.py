@@ -140,7 +140,7 @@ def get_training_history_table(model):
     Parameters
     ----------
     model : SurvivalPredictor
-        Predictor with train_history_ populated by history=True.
+        Predictor with ``train_history_`` populated by ``history=True``.
 
     Returns
     -------
@@ -169,7 +169,7 @@ def plot_training_history(model):
     Parameters
     ----------
     model : SurvivalPredictor
-        Predictor with train_history_ populated by history=True.
+        Predictor with ``train_history_`` populated by ``history=True``.
 
     Returns
     -------

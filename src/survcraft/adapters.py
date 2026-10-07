@@ -946,7 +946,7 @@ class SurvivalEstimator(BaseEstimator):
         Returns
         -------
         str
-            Existing device_ or a newly selected device.
+            Existing ``device_`` or a newly selected device.
 
         Notes
         -----
@@ -1085,7 +1085,7 @@ class SurvivalEstimator(BaseEstimator):
         Returns
         -------
         None
-            Assigns model_ and selects device_ if needed.
+            Assigns ``model_`` and selects ``device_`` if needed.
 
         Notes
         -----
@@ -1475,7 +1475,7 @@ class SurvivalPredictor(SurvivalEstimator):
         Returns
         -------
         None
-            Updates model_ and, if requested, train_history_.
+            Updates ``model_`` and, if requested, ``train_history_``.
 
         Raises
         ------
@@ -1665,12 +1665,12 @@ class SurvivalPredictor(SurvivalEstimator):
         -------
         dict of str to torch.Tensor
             Transformed parameter groups of shape ``(n_samples, group_width)``
-            on device_, computed without gradients.
+            on ``device_``, computed without gradients.
 
         Raises
         ------
         RuntimeError
-            If model_ has not been initialized.
+            If ``model_`` has not been initialized.
 
         Notes
         -----
@@ -1776,7 +1776,7 @@ class SurvivalSimulator(SurvivalEstimator):
         Notes
         -----
         Uses :meth:`SurvivalEstimator.predict` and its mode validation.
-        Initialization uses no observed outcomes and caches model_ on first use.
+        Initialization uses no observed outcomes and caches ``model_`` on first use.
         """
         if not hasattr(self, "model_"):
             self._init_model(X, None, None)

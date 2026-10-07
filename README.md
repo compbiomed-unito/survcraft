@@ -9,6 +9,24 @@ The package is intended for research and experimentation where the model
 architecture, survival distribution, and training loss need to be mixed,
 matched, or extended.
 
+## Documentation
+
+The [documentation](https://compbiomed-unito.github.io/survcraft/) includes a
+quick start, model and data conventions, and an API reference generated from
+the docstrings. It describes the default branch and may include changes not yet
+released on PyPI.
+
+To build it locally with Python 3.11 or newer:
+
+```bash
+pip install -e ".[docs]"
+python -m sphinx -b html -W --keep-going docs docs/_build/html
+```
+
+Open `docs/_build/html/index.html` to view the result. See
+[the documentation maintenance guide](docs/contributing.md) for editing and
+GitHub Pages setup.
+
 ## Features
 
 - PyTorch modules for common survival distributions, including exponential,
