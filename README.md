@@ -86,9 +86,13 @@ survival = model.predict("survival", X[:5], times)
 failure = model.predict("failure", X[:5], times)
 ```
 
-`y` is expected to be a NumPy structured array with boolean `event` and numeric
-`time` fields. This is compatible with the common `scikit-survival` target
-format.
+`y` and optional `y_test` must be one-dimensional NumPy structured arrays with
+exactly two fields, in order: scalar boolean events (`True` means the event was
+observed), then scalar real numeric times. Times must be finite and nonnegative.
+Fields are selected by position; their names are arbitrary and may differ
+between training and test targets. For example, both `[("event", "?"),
+("time", "f4")]` and `[("status", "?"), ("duration", "f8")]` are supported.
+This follows the common `scikit-survival` target convention.
 
 ## Core Concepts
 
