@@ -11,6 +11,7 @@ from these identities. Risk is a ranking score, with larger values
 indicating earlier events; it is implemented only by selected modules.
 """
 
+import math
 import torch
 from warnings import warn
 
@@ -815,13 +816,20 @@ class WeibullSurvivalModule(BaseSurvivalModule):
 
     .. math::
 
-        a(t)=\operatorname{clamp}(-(t/\lambda)^k,-20,20),\quad S(t)=e^{a(t)},
+        H(t)=\exp\left(\min\left[k(\log t-\log\lambda),\log 20\right]\right),
+        \quad S(t)=e^{-H(t)},
 
         f(t)=(k/\lambda)(t/\lambda)^{k-1}S(t),\quad
         h(t)=(k/\lambda)(t/\lambda)^{k-1},
 
         E[T]=\lambda\Gamma(1+1/k),\quad
         \operatorname{median}(T)=\lambda(\log 2)^{1/k}.
+
+    This is equivalent to capping :math:`(t/\lambda)^k` at 20, but applies
+    the cap in log space to avoid overflowing powers and NaN gradients.
+    Survival is exactly one at t=0, with zero parameter gradients. Scales
+    below the dtype's smallest positive normal value are floored to that
+    value before taking logs, including softplus outputs that underflow to zero.
 
     Density is forced to zero at t=0, even when the mathematical limit is
     nonzero or infinite. Survival clipping imposes a positive tail floor;
@@ -874,9 +882,18 @@ class WeibullSurvivalModule(BaseSurvivalModule):
         BaseSurvivalModule : Shared tensor and device contract.
         """
         l, k = params["scale"], params["shape"]
-        exponent = torch.clamp(-torch.pow(times / l, k), min=-20.0, max=20.0)
-        exponent = torch.clamp(-torch.pow(times / l, k), min=-20.0, max=20.0)
-        return torch.exp(exponent)
+        l = l.clamp_min(torch.finfo(l.dtype).tiny)
+        zero_times = times == 0
+        safe_times = torch.where(zero_times, torch.ones_like(times), times)
+        # Clamp before exponentiation: clamping an overflowing power afterwards
+        # leaves inf * 0 in its backward pass, even with finite predictions.
+        log_power = k * (torch.log(safe_times) - torch.log(l))
+        
+        # Keep the inner exponential finite, with margin for rounding.
+        max_log_power = math.log(torch.finfo(log_power.dtype).max) - 1.0
+        power = torch.exp(log_power.clamp(max=max_log_power))
+        #power = torch.exp(log_power.clamp(max=math.log(20.0)))
+        return torch.where(zero_times, torch.ones_like(power), torch.exp(-power))
 
     def density(self, params, times):
         r"""Return the event-time probability density f(t).
@@ -902,7 +919,7 @@ class WeibullSurvivalModule(BaseSurvivalModule):
         l, k = params["scale"], params["shape"]
         return torch.where(
             times > 0.0,
-            (k / l) * torch.pow(times / l, k - 1) * self.survival(params, times),
+            self.hazard(params, times) * self.survival(params, times),
             self.zero,
         )
         scaled_times = times / l
