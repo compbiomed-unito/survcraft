@@ -1261,6 +1261,10 @@ class SurvivalPredictor(SurvivalEstimator):
         Policy for non-finite raw parameters and predictions.
     batch_size : int, default=256
         Training and validation mini-batch size.
+    bulk_batching : bool, default=True
+        Select whole batches directly from the dataset for training and
+        validation. Set False to fetch individual samples and stack them
+        using PyTorch's standard automatic batching.
     learning_rate : float, default=0.005
         Adam learning rate.
     weight_decay : float, default=0.0
@@ -1346,6 +1350,44 @@ class SurvivalPredictor(SurvivalEstimator):
 
     # these options give convenience but may have speed impact, should evaluate with some tests
     history: bool = False # collect training history data
+    bulk_batching: bool = True
+
+    def _make_data_loader(
+        self, dataset: torch.utils.data.Dataset, *, shuffle: bool = False
+    ) -> torch.utils.data.DataLoader:
+        r"""Build a loader for tensor data or a validation/training subset.
+
+        Parameters
+        ----------
+        dataset : torch.utils.data.TensorDataset or torch.utils.data.Subset
+            Dataset supporting whole-batch indexing by a list of indices.
+        shuffle : bool, default=False
+            Shuffle sample indices each epoch.
+
+        Returns
+        -------
+        torch.utils.data.DataLoader
+            Feature, event, and time batches, including the final partial batch.
+        """
+        if self.bulk_batching:
+            sampler = (
+                torch.utils.data.RandomSampler(dataset) if shuffle
+                else torch.utils.data.SequentialSampler(dataset)
+            )
+            return torch.utils.data.DataLoader(
+                dataset,
+                batch_size=None,
+                sampler=torch.utils.data.BatchSampler(
+                    sampler, batch_size=self.batch_size, drop_last=False
+                ),
+                num_workers=self.data_loader_num_workers,
+            )
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+            num_workers=self.data_loader_num_workers,
+        )
 
     @staticmethod
     def _extract_target(
@@ -1512,19 +1554,11 @@ class SurvivalPredictor(SurvivalEstimator):
             train_dataset = dataset
             val_dataset = None
 
-        train_dl = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.data_loader_num_workers,
-            shuffle=True,  # some survival losses cannot be computed if there are no events in the batch, so we reshuffle to avoid losing the same batches everytime
-        )
+        # Reshuffle event-free batches so the same samples are not skipped each epoch.
+        train_dl = self._make_data_loader(train_dataset, shuffle=True)
         min_val_model_state = None
         if self.early_stopping:
-            val_dl = torch.utils.data.DataLoader(
-                val_dataset,
-                batch_size=self.batch_size,
-                num_workers=self.data_loader_num_workers,
-            )
+            val_dl = self._make_data_loader(val_dataset, shuffle=False)
             min_val_loss = None
 
         # if test_data > 0 and test_data < 1: # could implement splitting
