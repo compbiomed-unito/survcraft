@@ -13,4 +13,5 @@ module references for distribution mathematics and loss definitions.
    survival
    losses
    plotting
+   datasets
    utilities

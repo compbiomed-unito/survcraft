@@ -5,7 +5,7 @@ import pytest
 import torch
 
 import survcraft.adapters as ad
-import survcraft.util
+from survcraft.datasets import load_dataset
 
 
 def set_seed(seed=0):
@@ -23,7 +23,7 @@ def deterministic_seed():
 
 @pytest.fixture(scope="session")
 def whas500_data():
-    data = survcraft.util.get_test_data()
+    data = load_dataset("sksurv:whas500", seed=0)
     return {
         "X_train": data["X_train"][:128].astype(np.float32),
         "X_test": data["X_test"][:64].astype(np.float32),

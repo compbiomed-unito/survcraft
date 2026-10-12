@@ -82,3 +82,25 @@ time zero. The general `plot_outputs` helper includes zero in its time grid.
 
 See {py:class}`survcraft.adapters.SurvivalPredictor` for training options and
 {py:meth}`survcraft.adapters.SurvivalEstimator.predict` for prediction modes.
+
+## Load a dataset
+
+```python
+from survcraft.datasets import list_datasets, load_dataset
+
+print(list_datasets())
+data = load_dataset("sksurv:gbsg2", seed=0, test_size=0.2)
+model.fit(data["X_train"], data["y_train"])
+```
+
+The split uses event stratification. Imputation, quantile normalization,
+one-hot encoding, and constant-feature removal are fitted on training rows only.
+Feature arrays are dense float32; targets have boolean `event` and float64 `time`
+fields. The returned dictionary includes test targets, evaluation targets
+censored at the maximum training time, row indices, and metadata. When any time
+is zero, all observed times are shifted by the smallest positive time.
+
+Scikit-survival datasets are included with the core package. Install
+`survcraft[datasets]` for SurvSet; when it is missing, discovery warns and skips
+its datasets. See {py:func}`survcraft.datasets.load_dataset` for preprocessing,
+exclusions, and the complete return contract.

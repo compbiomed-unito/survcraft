@@ -138,55 +138,6 @@ def detect_max_survival_time(model, X, tol=1e-2, q=0.5):
     return np.pow(10.0, max_time_log)
 
 
-def get_test_data():
-    r"""Load and split WHAS500 data with robustly scaled numeric features.
-
-    Returns
-    -------
-    dict of str to numpy.ndarray
-        X_train, X_test, y_train, y_test, time_train, time_test, event_train,
-        and event_test. Targets use boolean event and float64 time fields.
-
-    Notes
-    -----
-    Uses a stratified train/test split with random_state=0 and scikit-learn
-    default test fraction. Fits RobustScaler on training features only.
-    Requires scikit-survival and converts the loaded features to floats.
-    """
-    from sklearn.model_selection import train_test_split
-    from sklearn.preprocessing import RobustScaler, OneHotEncoder
-    import sksurv.datasets
-
-    X, y = sksurv.datasets.load_whas500()
-    #X, y = sksurv.datasets.load_flchain()
-    #X = OneHotEncoder().fit_transform(X)
-    #X, y = sksurv.datasets.load_gbsg2()  # this y seems to have events as false...
-    
-    y.dtype = np.dtype([("event", "?"), ("time", "<f8")])
-    (
-        X_train,
-        X_test,
-        y_train,
-        y_test,
-        time_train,
-        time_test,
-        event_train,
-        event_test,
-    ) = train_test_split(X.astype(float), y, y["time"], y["event"], stratify=y["event"], random_state=0)
-    scaler = RobustScaler()
-    X_train_norm = scaler.fit_transform(X_train)
-    X_test_norm = scaler.transform(X_test)
-    return dict(
-        X_train=X_train_norm,
-        X_test=X_test_norm,
-        y_train=y_train,
-        y_test=y_test,
-        time_train=time_train,
-        time_test=time_test,
-        event_train=event_train,
-        event_test=event_test,
-    )
-
 def replace_zero_times(times):
     r"""Replace zero times with the smallest strictly positive time.
 
