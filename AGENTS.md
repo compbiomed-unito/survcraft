@@ -1,6 +1,18 @@
 ## Coding
 Code should be readable and, when possibile, concise. In particular, some validation of input is good but there is no need for overly long chunks of validation code that will hide the functional code.
 
+## Package architecture
+
+SurvCraft separates scikit-learn configuration and orchestration from differentiable PyTorch computation:
+
+- **Estimators — `src/survcraft/adapters.py`:** `SurvivalEstimator` owns shared data validation, tensor/device handling, model construction, and prediction. `SurvivalPredictor` builds and trains a model on observed event/censoring outcomes using a configured loss, with batching and optional early stopping. `SurvivalSimulator` builds a model lazily without training and samples outcomes from its failure probabilities on a time grid, placing events at interval midpoints and censoring at the final grid point.
+- **Input adapters and modules — `src/survcraft/adapters.py` and `src/survcraft/input_modules.py`:** `BaseInputAdapter` and its concrete adapters hold scikit-learn-compatible constructor options; `get_module(input_size, output_size)` creates a fresh PyTorch feature map. The module maps features `(n_samples, n_features)` to raw survival parameters `(n_samples, n_params)`. `FeedForwardNet` provides trainable mappings; `LinearFunctionInputModule` provides fixed affine mappings for simulation.
+- **Survival adapters and modules — `src/survcraft/adapters.py` and `src/survcraft/survival_modules.py`:** `BaseSurvivalAdapter.get_module(event, time)` preprocesses configuration, optionally using observed outcomes, and constructs a fresh `BaseSurvivalModule`. Nested adapters construct baseline/mixture modules recursively. Survival modules define parameter counts and constraints and implement distribution quantities such as survival, failure, density, hazard, and time summaries. The survival module's `get_param_number()` determines the input module's output width.
+- **Composition — `TorchModel` in `src/survcraft/adapters.py`:** The estimator stores the assembled PyTorch model as `model_`. Its forward path is `features -> input module -> raw parameters -> survival module -> requested prediction`; the survival module transforms raw parameters into constrained, named parameters. Estimator prediction converts tensor results back to NumPy arrays (or a dictionary for parameter predictions).
+- **Losses — `src/survcraft/loss_modules.py`:** `BaseSurvivalLoss` subclasses receive `(model, x, event, time)`, request the prediction modes needed by their objective, handle censoring, and return a scalar tensor to minimize. Objectives include full/partial likelihood, Brier, classification, and squared losses. Addition and scalar multiplication create `LinearCombinationLoss`; predictor training backpropagates through the composed model.
+
+When extending the package, keep configuration/preprocessing in adapters, tensor mathematics in modules, and optimization objectives in losses. Follow the shared base-class contracts for shapes, prediction modes, and devices; `event=True` means an observed event and `False` means right censoring. Add a matching adapter for a new module so estimators can construct it through the same path.
+
 ## Documentation
 
 ### API documentation
