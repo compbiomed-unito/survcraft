@@ -61,11 +61,13 @@ Optional dependency groups are available for common workflows:
 ```bash
 pip install "survcraft[plotting]"
 pip install "survcraft[tutorials]"
-pip install "survcraft[sksurv]"
+pip install "survcraft[datasets]"
 pip install "survcraft[test]"
 ```
 
-The core package depends on PyTorch, NumPy, and scikit-learn.
+The core package depends on PyTorch, NumPy, scikit-learn, and scikit-survival.
+Scikit-survival itself requires pandas. The `datasets` extra adds optional
+SurvSet datasets.
 
 ## Quick Start
 
@@ -191,20 +193,54 @@ Install the tutorial dependencies with:
 pip install "survcraft[tutorials]"
 ```
 
-Some tutorials may also require optional survival-analysis dependencies:
+Scikit-survival is included with the core package. To add SurvSet datasets:
 
 ```bash
-pip install "survcraft[sksurv]"
+pip install "survcraft[datasets]"
 ```
 
+## Load example datasets
+
+List available datasets and load a normalized, event-stratified train/test split:
+
+```python
+from survcraft.datasets import list_datasets, load_dataset
+
+print(list_datasets())
+data = load_dataset("sksurv:gbsg2", seed=0, test_size=0.2)
+model.fit(data["X_train"], data["y_train"])
+```
+
+Use this with a configured predictor such as `model` in the quick start.
+Unambiguous short names such as `"gbsg2"` also work. Features are dense float32
+arrays; targets have boolean `event` and float64 `time` fields. Numeric features
+are median-imputed and quantile-normalized; categorical features are mode-imputed
+and one-hot encoded. Constant features are removed. All preprocessing learns
+from training rows only.
+
+The returned dictionary also contains `y_test`, `y_eval`, original split indices,
+and `metadata`. `y_eval` censors test follow-up beyond the largest training time
+for evaluation. When source times include zero, all times are shifted by the
+smallest positive time. Positive competing-event codes are treated as all-cause
+events. Identifiers and known post-outcome features are excluded.
+
+Install `survcraft[datasets]` to add SurvSet. If it is missing, listing and loading
+warn and skip its datasets. Duplicate cohorts and time-varying datasets are
+excluded; unsupported repeated-subject data can fail when loaded. See the
+[dataset API reference](docs/api/datasets.rst) for the full return contract.
+
 ## Development
+
+The [heavy model benchmark](benchmarks/README.md) tests default survival/loss
+combinations across scikit-survival and SurvSet datasets, with two Cox baselines,
+survmetr scores, fit timings, and resumable failure reports.
 
 Clone the repository and install the package in editable mode:
 
 ```bash
 git clone https://github.com/compbiomed-unito/survcraft.git
 cd survcraft
-pip install -e ".[test,plotting,sksurv]"
+pip install -e ".[test,plotting,datasets]"
 ```
 
 Run the test suite:
