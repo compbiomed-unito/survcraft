@@ -114,6 +114,9 @@ class BaseInputAdapter(BaseEstimator, ABC):
     ----------
     module_class : type of torch.nn.Module
         Constructor supplied by each concrete adapter.
+    simulation_only : bool, default=False
+        Class attribute. If True, the adapter is intended for simulation and
+        is rejected by :class:`SurvivalPredictor` when training.
 
     Notes
     -----
@@ -136,6 +139,7 @@ class BaseInputAdapter(BaseEstimator, ABC):
             Constructor accepting feature and parameter widths and adapter options.
         """
         raise NotImplementedError
+    simulation_only: ClassVar[bool] = False
 
     def get_module(self, input_size: int, output_size: int) -> Module:
         r"""Build a fresh feature-to-parameter module.
@@ -174,6 +178,12 @@ class LinearFunctionInputAdapter(BaseInputAdapter):
     seed : int, optional
         Seed the local PyTorch generator in random mode.
 
+    Attributes
+    ----------
+    simulation_only : bool
+        True; this adapter supports simulation with :class:`SurvivalSimulator`
+        and cannot be used to train a :class:`SurvivalPredictor`.
+
     Notes
     -----
     Uses the construction contract in :class:`BaseInputAdapter`. The output
@@ -184,6 +194,7 @@ class LinearFunctionInputAdapter(BaseInputAdapter):
     survcraft.input_modules.LinearFunctionInputModule : Affine implementation.
     """
     module_class = input_modules.LinearFunctionInputModule
+    simulation_only: ClassVar[bool] = True
 
     mode: Literal["identity", "random"] = "identity"
     multiplier: float = 1.0
@@ -248,6 +259,10 @@ class BaseSurvivalAdapter(BaseEstimator, ABC):
     ----------
     module_class : type of survcraft.survival_modules.BaseSurvivalModule
         Constructor supplied by concrete adapters.
+    simulation_only : bool, default=False
+        Class attribute. If True, the adapter is intended for simulation and
+        is rejected by :class:`SurvivalPredictor` when training, including
+        when used as a nested baseline or mixture component.
     param_funcs : dict of str to callable
         Parameter transformations called as ``func(value, event, time)``.
 
@@ -274,6 +289,8 @@ class BaseSurvivalAdapter(BaseEstimator, ABC):
             Constructor accepting transformed adapter parameters.
         """
         raise NotImplementedError
+
+    simulation_only: ClassVar[bool] = False
 
     # functions to be applied to parameters for preprocessing before passing it to the torch module (for instance for arrays that needs to be converted to tensors or for derived modules that need to initialized their submodules)
     param_funcs: ClassVar[
@@ -395,6 +412,12 @@ class FractalNoiseSurvivalAdapter(BaseSurvivalAdapter):
     seed : int, optional
         Seed for Python's global random generator during construction.
 
+    Attributes
+    ----------
+    simulation_only : bool
+        True; this adapter supports simulation with :class:`SurvivalSimulator`
+        and cannot be used to train a :class:`SurvivalPredictor`.
+
     Notes
     -----
     Uses :class:`BaseSurvivalAdapter`. This module has no trainable raw
@@ -406,6 +429,7 @@ class FractalNoiseSurvivalAdapter(BaseSurvivalAdapter):
     seed: Optional[int] = None
 
     module_class = survival_modules.FractalNoiseSurvivalModule
+    simulation_only: ClassVar[bool] = True
 
 
 @dataclass
@@ -1248,8 +1272,10 @@ class SurvivalPredictor(SurvivalEstimator):
     ----------
     input : BaseInputAdapter, optional
         Feature-map factory; defaults to a new FeedForwardNetAdapter.
+        Must have simulation_only=False.
     survival : BaseSurvivalAdapter, optional
         Distribution factory; defaults to a new ExponentialSurvivalAdapter.
+        This adapter and its nested adapters must have simulation_only=False.
     loss : survcraft.loss_modules.BaseSurvivalLoss, optional
         Training objective; defaults to a new BrierLoss.
     device : str or sequence of str, default='cpu'
@@ -1456,7 +1482,8 @@ class SurvivalPredictor(SurvivalEstimator):
         Raises
         ------
         ValueError
-            If a supplied structured target violates the target contract.
+            If a supplied structured target violates the target contract or
+            an input or survival adapter is simulation-only.
         FailedConvergence
             If an epoch has no usable training batches.
 
@@ -1522,8 +1549,9 @@ class SurvivalPredictor(SurvivalEstimator):
         Raises
         ------
         ValueError
-            If times are negative, module construction fails, or prediction
-            divergence violates the policy.
+            If an input or survival adapter (including nested adapters) is
+            simulation-only, times are negative, module construction fails,
+            or prediction divergence violates the policy.
         AssertionError
             If sample counts do not match or event dtype is not boolean.
         FailedConvergence
@@ -1536,6 +1564,25 @@ class SurvivalPredictor(SurvivalEstimator):
         validation of :meth:`fit`. Move losses with buffers to the model device
         before training. Non-finite validation losses are not filtered.
         """
+        # check that input and survival adapters do not have the simulation_only flag
+        adapters = [("input", self.input), ("survival", self.survival)]
+        while adapters:
+            name, adapter = adapters.pop()
+            if adapter.simulation_only:
+                raise ValueError(
+                    f"{name} ({type(adapter).__name__}) is simulation-only "
+                    "and cannot be used in SurvivalPredictor; use SurvivalSimulator instead"
+                )
+            for key, value in adapter.get_params(deep=False).items():
+                if isinstance(value, (BaseInputAdapter, BaseSurvivalAdapter)):
+                    adapters.append((f"{name}.{key}", value))
+                elif isinstance(value, (list, tuple)):
+                    adapters.extend(
+                        (f"{name}.{key}[{i}]", item)
+                        for i, item in enumerate(value)
+                        if isinstance(item, (BaseInputAdapter, BaseSurvivalAdapter))
+                    )
+
         if not hasattr(self, "model_") or not warm_start:
             self._init_model(X, event, time)
             self.train_history_ = []

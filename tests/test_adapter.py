@@ -1,11 +1,7 @@
 import numpy as np
 import pytest
-import torch
 
 from survcraft import adapters as ad
-from survcraft import loss_modules as lm
-from survcraft.util import get_loss_modules, get_subclasses_in_module, get_survival_adapters
-
 
 @pytest.mark.parametrize("warm_start", [True, False])
 @pytest.mark.parametrize("early_stopping", [True, False])

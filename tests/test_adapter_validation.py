@@ -228,3 +228,47 @@ def test_break_quantiles_use_only_observed_events():
 def test_direct_step_module_rejects_invalid_breaks(breaks):
     with pytest.raises(ValueError, match="breaks"):
         sm.StepExpSurvivalModule(breaks)
+
+
+@pytest.mark.parametrize("adapter_class, expected", [
+    (ad.FeedForwardNetAdapter, False),
+    (ad.ExponentialSurvivalAdapter, False),
+    (ad.LinearFunctionInputAdapter, True),
+    (ad.FractalNoiseSurvivalAdapter, True),
+])
+def test_simulation_only_is_class_attribute(adapter_class, expected):
+    adapter = clone(adapter_class())
+    assert adapter.simulation_only is expected
+    assert "simulation_only" not in adapter.get_params()
+
+
+@pytest.mark.parametrize("options, path", [
+    ({"input": ad.LinearFunctionInputAdapter()}, "input"),
+    ({"survival": ad.FractalNoiseSurvivalAdapter()}, "survival"),
+    ({"survival": ad.ProportionalHazardSurvivalAdapter(
+        baseline=ad.FractalNoiseSurvivalAdapter())}, "survival.baseline"),
+    ({"survival": ad.AcceleratedFailureTimeSurvivalAdapter(
+        baseline=ad.FractalNoiseSurvivalAdapter())}, "survival.baseline"),
+    ({"survival": ad.MixtureSurvivalAdapter(baselines=[
+        ad.ExponentialSurvivalAdapter(),
+        ad.ProportionalHazardSurvivalAdapter(
+            baseline=ad.FractalNoiseSurvivalAdapter()),
+    ])}, "survival.baselines[1].baseline"),
+])
+@pytest.mark.parametrize("entry_point", ["fit", "train", "warm_start"])
+def test_predictor_rejects_simulation_only_adapters(options, path, entry_point):
+    predictor = ad.SurvivalPredictor(**options)
+    X = np.ones((4, 2), dtype=np.float32)
+    event = np.ones(4, dtype=bool)
+    time = np.arange(1, 5, dtype=np.float32)
+    if entry_point == "warm_start":
+        predictor.model_ = object()
+    with pytest.raises(ValueError, match="simulation-only") as error:
+        if entry_point == "fit":
+            y = np.array(list(zip(event, time)), dtype=[("event", bool), ("time", float)])
+            predictor.fit(X, y)
+        else:
+            predictor.train(X, event, time, warm_start=entry_point == "warm_start")
+    assert path in str(error.value)
+    if entry_point != "warm_start":
+        assert not hasattr(predictor, "model_")

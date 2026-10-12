@@ -6,7 +6,7 @@ import torch
 import inspect
 from . import adapters, loss_modules, survival_modules#, input_modules
 
-def get_subclasses_in_module(module, base_class, include_abstract=False):
+def get_subclasses_in_module(module, base_class):
     r"""Find locally defined subclasses of a supplied base class.
 
     Parameters
@@ -15,31 +15,31 @@ def get_subclasses_in_module(module, base_class, include_abstract=False):
         Python module to inspect.
     base_class : type
         Parent class to match; the parent itself is excluded.
-    include_abstract : bool, default=False
-        Include classes marked abstract by inspect.isabstract.
 
     Returns
     -------
-    list of type
+    iterator of classes
         Locally defined subclasses in inspect.getmembers name order.
 
     Notes
     -----
-    Classes imported from another module are excluded. Inherited stubs do
-    not make a class abstract unless the Python ABC machinery marks it so.
+    Abstract classes and classes imported from another module are excluded. 
+    Inherited stubs do not make a class abstract unless the Python ABC 
+    machinery marks it so.
     """
-    subclasses = []
+
     for _, obj in inspect.getmembers(module, inspect.isclass):
         if obj.__module__ == module.__name__ and issubclass(obj, base_class) and obj is not base_class:
-            if include_abstract or not inspect.isabstract(obj):
-                subclasses.append(obj)
+            if not inspect.isabstract(obj):
+                yield obj
 
-    return subclasses
+def get_input_adapters(include_simulation=False):
+    return [
+        ia for ia in get_subclasses_in_module(adapters, adapters.BaseInputAdapter)
+        if include_simulation or not ia.simulation_only
+    ]
 
-#def get_input_adapters():
-#    return get_subclasses_in_module(adapters, adapters.BaseInputAdapter)
-
-def get_survival_adapters():
+def get_survival_adapters(include_simulation=False):
     r"""List concrete survival adapter classes defined in adapters.
 
     Returns
@@ -51,7 +51,10 @@ def get_survival_adapters():
     --------
     get_subclasses_in_module : Discovery rules.
     """
-    return get_subclasses_in_module(adapters, adapters.BaseSurvivalAdapter)
+    return [
+        sa for sa in get_subclasses_in_module(adapters, adapters.BaseSurvivalAdapter)
+        if include_simulation or not sa.simulation_only
+    ]
 
 def get_loss_modules():
     r"""List concrete survival loss classes defined in loss_modules.

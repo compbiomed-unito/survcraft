@@ -4,7 +4,7 @@ import torch
 
 from survcraft import adapters as ad
 from survcraft import loss_modules as lm
-from survcraft.util import get_loss_modules, get_subclasses_in_module, get_survival_adapters
+from survcraft.util import get_loss_modules, get_input_adapters, get_survival_adapters
 
 
 def build_predictor(survival, loss):
@@ -92,27 +92,15 @@ def build_discovered_loss(loss_cls):
     return loss_cls()
 
 
-DISCOVERED_INPUT_ADAPTERS = [
-    input_cls
-    for input_cls in get_subclasses_in_module(ad, ad.BaseInputAdapter)
-    if input_cls is not ad.LinearFunctionInputAdapter
-]
-DISCOVERED_SURVIVAL_ADAPTERS = [
-    survival_cls
-    for survival_cls in get_survival_adapters()
-    if survival_cls is not ad.FractalNoiseSurvivalAdapter
-]
-DISCOVERED_LOSSES = get_loss_modules()
-
 EXPECTED_INCOMPATIBLE_COMBINATIONS = {
     (ad.LevySurvivalAdapter, lm.SquaredLoss),
     (ad.ProportionalHazardSurvivalAdapter, lm.SquaredLoss),
 }
 
 
-@pytest.mark.parametrize("input_cls", DISCOVERED_INPUT_ADAPTERS, ids=module_id)
-@pytest.mark.parametrize("survival_cls", DISCOVERED_SURVIVAL_ADAPTERS, ids=module_id)
-@pytest.mark.parametrize("loss_cls", DISCOVERED_LOSSES, ids=module_id)
+@pytest.mark.parametrize("input_cls", get_input_adapters(include_simulation=False), ids=module_id)
+@pytest.mark.parametrize("survival_cls", get_survival_adapters(include_simulation=False), ids=module_id)
+@pytest.mark.parametrize("loss_cls", get_loss_modules(), ids=module_id)
 def test_predictor_fit_and_predict_with_all_discovered_trainable_modules(
     input_cls,
     survival_cls,
