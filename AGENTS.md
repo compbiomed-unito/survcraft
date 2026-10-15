@@ -1,5 +1,10 @@
 ## Coding
-Code should be readable and, when possibile, concise. In particular, some validation of input is good but there is no need for overly long chunks of validation code that will hide the functional code.
+Code should be readable and, when possibile, concise. In particular, some validation of input is good but there is no need for overly long chunks of validation code that will hide the functional code. Do not overengineer. If you believe a non-explicitly required feature or check would be a good idea, ask confirmation before starting to implement it.
+
+
+## Git
+Do not perform any commit or other change to the git configuration. Especially do not push or change in any way the remote github repository.
+
 
 ## Package architecture
 
