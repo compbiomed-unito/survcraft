@@ -23,6 +23,7 @@ import warnings
 
 import numpy as np
 import torch
+from joblib import Parallel, delayed
 from sksurv.linear_model import CoxPHSurvivalAnalysis
 from sksurv.metrics import integrated_brier_score
 
@@ -225,10 +226,28 @@ def _fit_case(factory, data, base, seed, scorer, warmup_epochs=0):
     return row
 
 
+def _fit_repeats(factory, data, base, training_seed, repeats, warmup_epochs):
+    from survmetr import AntoliniCIndexVecScorer
+
+    scorer = AntoliniCIndexVecScorer()
+    for repeat in range(repeats):
+        seed = training_seed + repeat
+        row = _fit_case(factory, data, {**base, "repeat": repeat, "training_seed": seed},
+                        seed, scorer, warmup_epochs if repeat == 0 else 0)
+        # Return plain configuration data rather than live modules/GPU tensors.
+        if "options" in row:
+            row["options"] = json.loads(json.dumps(row["options"], default=_json_default))
+        yield row
+
+
+def _fit_worker(*args):
+    return list(_fit_repeats(*args))
+
+
 def run_benchmark(models, datasets=None, *, repeats=3, warmup_epochs=1,
                   split_seed=0, training_seed=123, test_size=0.2,
                   min_train_samples=0, max_train_samples=None, filter_small_datasets=False,
-                  output="benchmark/results/models.csv", run_metadata=None):
+                  workers=1, output="benchmark/results/models.csv", run_metadata=None):
     """Fit named predictor factories and save timing and predictive metrics.
 
     Parameters
@@ -259,6 +278,10 @@ def run_benchmark(models, datasets=None, *, repeats=3, warmup_epochs=1,
         Sampling follows loader preprocessing, which uses the full training split.
     filter_small_datasets : bool, default=False
         Also exclude datasets with fewer than two training rows per feature.
+    workers : int, default=1
+        Concurrent model configurations in separate joblib worker processes.
+        One runs sequentially in the main process. Repeats of a configuration
+        stay together; datasets and the Cox reference are prepared in the parent.
     output : str or pathlib.Path, optional
         CSV path. This file and its .metadata.json companion are replaced.
     run_metadata : dict or None, optional
@@ -279,10 +302,14 @@ def run_benchmark(models, datasets=None, *, repeats=3, warmup_epochs=1,
 
     Notes
     -----
-    Execution is sequential. Both metrics use administratively censored y_eval
-    targets, adjusted to the sampled training horizon when capped. Case errors are recorded; interrupts
-    propagate. Predictors should use zero data-loader workers to avoid additional
-    processes. Repeats measure training variability, not split uncertainty.
+    Both metrics use administratively censored y_eval targets, adjusted to the
+    sampled training horizon when capped. Case errors are recorded; interrupts
+    propagate. With workers > 1, the parent writes results as configurations
+    finish; row order may vary. Factories must be serializable by joblib and
+    multiprocessing callers should use an ``if __name__ == "__main__"`` guard.
+    Keep predictor data-loader workers at zero to avoid nested multiprocessing.
+    Concurrent fits share CPU/GPU resources: use workers=1 for isolated timing.
+    Repeats measure training variability, not split uncertainty.
 
     Examples
     --------
@@ -297,6 +324,8 @@ def run_benchmark(models, datasets=None, *, repeats=3, warmup_epochs=1,
         raise ValueError("Provide models, positive repeats, and nonnegative warm-up/minimum sizes")
     if max_train_samples is not None and max_train_samples < 1:
         raise ValueError("max_train_samples must be positive or None")
+    if workers < 1:
+        raise ValueError("workers must be positive")
     if not 0 < test_size < 1:
         raise ValueError("test_size must be between zero and one")
     names = list_datasets() if datasets is None or list(datasets) == ["all"] else list(datasets)
@@ -305,7 +334,7 @@ def run_benchmark(models, datasets=None, *, repeats=3, warmup_epochs=1,
     metadata_path = output.with_suffix(".metadata.json")
     metadata = {
         "settings": dict(repeats=repeats, warmup_epochs=warmup_epochs, split_seed=split_seed,
-                         training_seed=training_seed, test_size=test_size,
+                         training_seed=training_seed, test_size=test_size, workers=workers,
                          min_train_samples=min_train_samples, max_train_samples=max_train_samples,
                          filter_small_datasets=filter_small_datasets),
         "caller": run_metadata, "python": platform.python_version(),
@@ -382,18 +411,22 @@ def run_benchmark(models, datasets=None, *, repeats=3, warmup_epochs=1,
                     continue
                 record(_fit_case(partial(CoxPHSurvivalAnalysis, alpha=1.0), data,
                                  {**base, "configuration": "cox-ridge"}, training_seed, scorer))
-                for label, factory in models.items():
+                jobs = [(factory, data, {**base, "configuration": label},
+                         training_seed, repeats, warmup_epochs)
+                        for label, factory in models.items()]
+                if workers == 1:
+                    results = (_fit_repeats(*job) for job in jobs)
+                else:
+                    results = Parallel(n_jobs=workers, backend="loky", return_as="generator_unordered")(
+                        delayed(_fit_worker)(*job) for job in jobs)
+                for configuration_rows in results:
                     times = []
-                    for repeat in range(repeats):
-                        seed = training_seed + repeat
-                        row = _fit_case(factory, data,
-                                        {**base, "configuration": label, "repeat": repeat,
-                                         "training_seed": seed}, seed, scorer,
-                                        warmup_epochs if repeat == 0 else 0)
+                    for row in configuration_rows:
                         record(row)
                         if row["status"] in ("success", "partial"):
                             times.append(row["fit_seconds"])
                     if times:
+                        label = row["configuration"]
                         print(f"{name} | {label}: median {statistics.median(times):.4f}s "
                               f"range {min(times):.4f}–{max(times):.4f}s", flush=True)
                 save_metadata()
@@ -452,6 +485,8 @@ def main():
                         help="Devices to sweep: cpu, cuda, cuda:N, or auto for CUDA with CPU fallback (default: auto)")
     parser.add_argument("--repeats", type=int, default=3,
                         help="Positive number of fresh measured fits per model and dataset (default: 3)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel model worker processes; 1 runs sequentially (default: 1)")
     parser.add_argument("--warmup-epochs", type=int, default=1,
                         help="Epochs in a separate unmeasured warm-up fit; 0 disables it (default: 1)")
     parser.add_argument("--split-seed", type=int, default=0,
@@ -488,7 +523,7 @@ def main():
             models, args.datasets, repeats=args.repeats, warmup_epochs=args.warmup_epochs,
             split_seed=args.split_seed, training_seed=args.training_seed, test_size=args.test_size,
             min_train_samples=args.min_train_samples, max_train_samples=args.max_train_samples,
-            filter_small_datasets=args.filter_small_datasets,
+            filter_small_datasets=args.filter_small_datasets, workers=args.workers,
             output=args.output, run_metadata=vars(args),
         )
     except (ValueError, ImportError, RuntimeError) as exc:
