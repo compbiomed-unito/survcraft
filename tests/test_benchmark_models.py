@@ -206,3 +206,46 @@ def test_cli_rejects_removed_learning_rate_option(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         benchmark.main()
     assert exc.value.code == 2
+
+
+def test_parallel_workers_preserve_results_and_isolate_failures(tmp_path, monkeypatch, data):
+    import os
+
+    pytest.importorskip("survmetr")
+    monkeypatch.setattr(benchmark, "load_dataset", lambda *args, **kwargs: data)
+    parent_pid = os.getpid()
+    runs = []
+    for workers in (1, 2):
+        def make_model():
+            if workers > 1:
+                assert os.getpid() != parent_pid, "Model ran in the parent process"
+            return predictor()
+
+        def broken_model():
+            raise ValueError("deliberate factory failure")
+
+        output = tmp_path / f"workers-{workers}.csv"
+        rows = benchmark.run_benchmark(
+            {"first": make_model, "broken": broken_model, "second": make_model},
+            ["valid"], workers=workers, repeats=2, warmup_epochs=1, output=output,
+        )
+        assert len(rows) == len(list(csv.DictReader(output.open()))) == 7
+        metadata = json.loads(output.with_suffix(".metadata.json").read_text())
+        assert metadata["settings"]["workers"] == workers
+        assert metadata["counts"] == {"success": 5, "failed": 2}
+        runs.append({(row["configuration"], row.get("repeat")): row for row in rows})
+    assert runs[0].keys() == runs[1].keys()
+    for key, sequential in runs[0].items():
+        parallel = runs[1][key]
+        assert sequential["status"] == parallel["status"]
+        assert sequential["errors"] == parallel["errors"]
+        if sequential["status"] == "success":
+            for metric in ("antolini_concordance", "integrated_brier_score"):
+                assert sequential[metric] == pytest.approx(parallel[metric])
+
+
+def test_worker_count_must_be_positive(tmp_path):
+    pytest.importorskip("survmetr")
+    with pytest.raises(ValueError, match="workers must be positive"):
+        benchmark.run_benchmark({"model": predictor}, ["valid"], workers=0,
+                                output=tmp_path / "unused.csv")
