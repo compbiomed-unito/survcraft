@@ -844,15 +844,18 @@ class TorchModel(torch.nn.Module):
         --------
         survcraft.survival_modules.BaseSurvivalModule.forward : Mode validation.
         """
+        # run the input and survival modules
         params = self.input_module(x)
-        self._check_tensor(params, name="raw params") # times not needed since params are not indexed by times
-
         preds = self.survival_module(mode, params, times)
-        if mode == "params":
-            for name, values in preds.items():
-                self._check_tensor(values, name=f"params[{name}]", context={"raw_params": params})
-        else:
-            self._check_tensor(preds, name=mode, times=times, context={"raw_params": params})
+
+        # do checks if needed
+        if self.check_divergence in {"warn", "raise"}:
+            self._check_tensor(params, name="raw params") # times not needed since params are not indexed by times
+            if mode == "params":
+                for name, values in preds.items():
+                    self._check_tensor(values, name=f"params[{name}]", context={"raw_params": params})
+            else:
+                self._check_tensor(preds, name=mode, times=times, context={"raw_params": params})
 
         return preds
 
@@ -1336,12 +1339,14 @@ class SurvivalPredictor(SurvivalEstimator):
     batch, so batch size can change the objective. Batches without observed
     events or with non-finite scalar losses are skipped; an epoch with no
     usable batches raises :class:`FailedConvergence`.
+    Detached training losses are collected on-device and copied to NumPy once
+    per epoch. Per-batch logging still reads each loss when verbose=3.
 
     Early stopping uses a random, unstratified split and the unweighted mean
     of validation batch losses. Test data are evaluated for history only;
     they do not supply the early-stopping validation set. Random network
     initialization, shuffling, and validation splitting are not seeded by
-    this estimator. Loss modules are not automatically moved to ``device_``.
+    this estimator. 
 
     Examples
     --------
@@ -1555,14 +1560,14 @@ class SurvivalPredictor(SurvivalEstimator):
         AssertionError
             If sample counts do not match or event dtype is not boolean.
         FailedConvergence
-            If every training batch in an epoch is skipped.
+            If every training batch in an epoch is skipped, or a non-finite
+            training loss occurs with check_divergence="raise".
 
         Notes
         -----
         Uses the algorithm and batching behavior in :class:`SurvivalPredictor`.
         This lower-level entry point does not perform the full structured-target
-        validation of :meth:`fit`. Move losses with buffers to the model device
-        before training. Non-finite validation losses are not filtered.
+        validation of :meth:`fit`. Non-finite validation losses are not filtered.
         """
         # check that input and survival adapters do not have the simulation_only flag
         adapters = [("input", self.input), ("survival", self.survival)]
@@ -1586,6 +1591,9 @@ class SurvivalPredictor(SurvivalEstimator):
         if not hasattr(self, "model_") or not warm_start:
             self._init_model(X, event, time)
             self.train_history_ = []
+
+        if isinstance(self.loss, Module):
+            self.loss.to(self._get_device())
 
         data_device = self._get_device() if self.preload_data else 'cpu'
         dataset = torch.utils.data.TensorDataset(
@@ -1614,7 +1622,9 @@ class SurvivalPredictor(SurvivalEstimator):
             X_test, event_test, time_test = self._validate_dataset(*test_data)
             if test_losses is None:
                 test_losses = [self.loss]
-            median_time = torch.median(time_test[event_test])
+            for lf in test_losses:
+                if isinstance(lf, Module):
+                    lf.to(self._get_device())
 
         optimizer = torch.optim.Adam(self.model_.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
         epoch = -1
@@ -1624,7 +1634,10 @@ class SurvivalPredictor(SurvivalEstimator):
             # TRAINING
             self.model_.train()
             
-            train_losses = []
+            train_losses = torch.empty(
+                len(train_dl), dtype=torch.float64, device=self._get_device()
+            )
+            usable_batches = 0
             event_free_batches = 0
             nonfinite_loss_batches = 0
             for batch, (Xb, eb, tb) in enumerate(train_dl):
@@ -1637,17 +1650,20 @@ class SurvivalPredictor(SurvivalEstimator):
                     tb = tb.to(transfer_batches_to)
 
                 loss = self.loss(self.model_, Xb, eb, tb)
-                loss_num = loss.item()
+                if self.check_divergence != "no":
+                    loss_num = loss.item()
+                    if not math.isfinite(loss_num):
+                        msg = f"Epoch {epoch}, batch {batch} produced non-finite loss: {loss_num}"
+                        if self.check_divergence == "raise":
+                            raise FailedConvergence(msg)
+                        elif self.check_divergence == "warn":
+                            warnings.warn(msg)
 
-                if not math.isfinite(loss_num):
-                    nonfinite_loss_batches += 1
-                    if self.verbose >= 1:
-                        warnings.warn(
-                            f"Epoch {epoch}, batch {batch} produced non-finite loss: {loss_num}"
-                        )
-                    continue  # ignore batch
+                        nonfinite_loss_batches += 1
+                        continue  # ignore batch
 
-                train_losses.append(loss_num)
+                train_losses[usable_batches] = loss.detach()
+                usable_batches += 1
                 optimizer.zero_grad()
                 loss.backward()
                 if self.gradient_clipping:
@@ -1655,7 +1671,9 @@ class SurvivalPredictor(SurvivalEstimator):
                 optimizer.step()
 
                 if self.verbose >= 3:
-                    print(f"Epoch {epoch}, training batch {batch}, loss = {loss.item()}")
+                    if self.check_divergence == "no":
+                        loss_num = loss.item()
+                    print(f"Epoch {epoch}, training batch {batch}, loss = {loss_num}")
             if event_free_batches or nonfinite_loss_batches:
                 reasons = []
                 if event_free_batches:
@@ -1663,18 +1681,20 @@ class SurvivalPredictor(SurvivalEstimator):
                 if nonfinite_loss_batches:
                     reasons.append(f"batches with non-finite losses: {nonfinite_loss_batches}")
                 msg = f"Skipped training batches in epoch {epoch} ({len(train_dl)} total): " + "; ".join(reasons)
-                if not train_losses:
+                if not usable_batches:
                     msg += "; no usable training batches remain"
                 warnings.warn(msg)
-                if not train_losses:
+                if not usable_batches:
                     raise FailedConvergence(msg)
 
-            train_losses = numpy.array(train_losses)
+            train_losses = train_losses[:usable_batches].cpu().numpy()
 
             # VALIDATION
             if val_dataset is not None:
                 self.model_.eval()
-                epoch_val_losses = torch.zeros(len(val_dl), dtype=torch.float32)
+                epoch_val_losses = torch.zeros(
+                    len(val_dl), dtype=torch.float32, device=self._get_device()
+                )
                 with torch.no_grad():
                     for batch, (Xb, eb, tb) in enumerate(val_dl):
                         if transfer_batches_to is not None:
@@ -1683,7 +1703,7 @@ class SurvivalPredictor(SurvivalEstimator):
                             tb = tb.to(transfer_batches_to)
                         val_loss = self.loss(self.model_, Xb, eb, tb)
                         epoch_val_losses[batch] = val_loss
-                    mean_val_loss = torch.mean(epoch_val_losses)
+                    mean_val_loss = torch.mean(epoch_val_losses).item()
 
                     # early stopping code
                     if (
@@ -1705,7 +1725,7 @@ class SurvivalPredictor(SurvivalEstimator):
                         end="",
                     )
                     if val_dataset is not None:
-                        print(f", validation loss = {mean_val_loss.item()}", end="")
+                        print(f", validation loss = {mean_val_loss}", end="")
                     print()
 
             # test dataset
