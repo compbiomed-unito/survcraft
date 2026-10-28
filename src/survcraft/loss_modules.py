@@ -65,10 +65,6 @@ def check_survival_outcomes(events, times):
         )
 
 
-def _run_model_and_mask(model, mode, x, times=None):
-    preds = model(mode, x, times)
-    retained = preds.isfinite().any(dim=1)
-    return preds, retained
 
 def _predict_with_mask(model, mode, x, times=None, check_divergence="raise"):
     policy = "no" if check_divergence == "skip" else check_divergence
@@ -605,6 +601,19 @@ def squared_loss(expected_times, events, times):
 class ClassificationLoss(BaseSurvivalLoss):
     r"""Define classification objectives on informative time/outcome pairs.
 
+    Parameters
+    ----------
+    gpu_mode : bool, default=False
+        Use fixed-size masked, elementwise reduction when True, or indexed
+        mean reduction when False. These paths are intended for GPU and CPU
+        respectively, but either can run on either device. Selection is
+        explicit, independent of the input device.
+
+    Attributes
+    ----------
+    gpu : bool
+        Selected reduction path, initialized from gpu_mode.
+
     Notes
     -----
     For evaluation times uj, the informative mask and binary labels are
@@ -619,9 +628,29 @@ class ClassificationLoss(BaseSurvivalLoss):
     per-time means. Censoring at or before an evaluation time is omitted.
     No IPCW correction is applied. An empty mask can produce NaN.
 
-    Subclasses select times with get_times and a scalar classification
-    criterion with get_classification_loss. Uses :class:`BaseSurvivalLoss`.
+    Under check_divergence="skip", an individual is omitted if any failure
+    probability on the original evaluation grid is non-finite. The grid is
+    not recomputed after skipping. No retained informative pairs produces
+    a NaN loss, allowing the trainer to skip that batch.
+
+    With gpu_mode=True, predictions and labels keep their full matrix
+    shape during reduction; excluded predictions are replaced with safe
+    values before evaluating the criterion. With gpu_mode=False, retained
+    rows and informative pairs are selected by boolean indexing. Both paths
+    use labels with the prediction dtype and compute the same objective up
+    to floating-point rounding. Neither repairs invalid upstream gradients.
+    Grid selection can still synchronize CUDA even in the masked path.
+
+    Subclasses select times with get_times and a classification criterion
+    with get_classification_loss. The indexed path requires a scalar mean;
+    the masked path requires reduction="none" and one loss per pair.
+    Uses :class:`BaseSurvivalLoss`.
     """
+    def __init__(self, gpu_mode: bool = False):
+        r"""Initialize the reduction path; see ClassificationLoss."""
+        super().__init__()
+        self.gpu = gpu_mode
+
     @abc.abstractmethod
     def get_times(self, event: torch.BoolTensor, time: Tensor) -> Tensor:
         r"""Choose the shared classification evaluation grid.
@@ -641,14 +670,16 @@ class ClassificationLoss(BaseSurvivalLoss):
         ...
     @staticmethod
     @abc.abstractmethod
-    def get_classification_loss() -> Callable[[Tensor, Tensor], Tensor]:
-        r"""Return the scalar classification criterion.
+    def get_classification_loss() -> Callable[..., Tensor]:
+        r"""Return the criterion for indexed or masked reduction.
 
         Returns
         -------
         callable
-            Function accepting prediction and label vectors and returning a
-            zero-dimensional mean loss tensor.
+            Function accepting predictions and labels of the same dtype.
+            The default reduction must be a scalar mean for the indexed path.
+            For gpu_mode=True, it must also accept reduction="none" and return
+            losses matching the input shape.
         """
         ...
 
@@ -691,17 +722,33 @@ class ClassificationLoss(BaseSurvivalLoss):
 
         # get predictions at appropriate times
         pred_times = self.get_times(events, times)
+
         preds, retained = _predict_with_mask(model, "failure", x, pred_times, check_divergence=check_divergence)
-        if retained is not None:
-            preds = preds[retained]
-            events, times = events[retained], times[retained]
+        if self.gpu:
+            # Keep masks on-device instead of extracting variable-length rows
+            # or pairs. Skipping removes every pair for the affected individual.
+            mask = (times.unsqueeze(-1) > pred_times) | events.unsqueeze(-1)
+            if retained is not None:
+                mask = mask & retained.unsqueeze(-1)
+            y = (times.unsqueeze(-1) <= pred_times) & events.unsqueeze(-1)
 
-        # mask non informative outcomes
-        mask = (times.unsqueeze(-1) > pred_times) | events.unsqueeze(-1)
-        # binary outcomes
-        y = (times.unsqueeze(-1) <= pred_times) & events.unsqueeze(-1)
+            # Mask before the criterion: NaNs and invalid BCE probabilities in
+            # excluded pairs must never enter its forward/backward calculation.
+            safe_preds = preds.masked_fill(~mask, 0.5)
+            pair_losses = self.get_classification_loss()(
+                safe_preds, y.to(preds.dtype), reduction="none")
+            return pair_losses.masked_fill(~mask, 0.0).sum() / mask.sum()
+        else:
+            if retained is not None:
+                preds = preds[retained]
+                events, times = events[retained], times[retained]
 
-        return self.get_classification_loss()(preds[mask], y[mask].to(torch.float32))
+            # mask non informative outcomes
+            mask = (times.unsqueeze(-1) > pred_times) | events.unsqueeze(-1)
+            # binary outcomes
+            y = (times.unsqueeze(-1) <= pred_times) & events.unsqueeze(-1)
+
+            return self.get_classification_loss()(preds[mask], y[mask].to(preds.dtype))
 
 class ClassificationBatchTimesLoss(ClassificationLoss):
     r"""Select a capped evaluation grid from batch outcomes.
@@ -716,7 +763,15 @@ class ClassificationBatchTimesLoss(ClassificationLoss):
         Remove duplicates before truncation using torch.unique.
     random_sampling : bool, default=False
         Randomly permute candidates before truncation when the count exceeds
-        max_times. Uses the global PyTorch RNG.
+        max_times. Uses the global PyTorch RNG on the time tensor's device.
+    gpu_mode : bool, default=False
+        Select the masked reduction when True or indexed mean when False;
+        see ClassificationLoss. Either path supports CPU or CUDA tensors.
+
+    Attributes
+    ----------
+    gpu : bool
+        Selected reduction path, initialized from gpu_mode.
 
     Notes
     -----
@@ -724,15 +779,18 @@ class ClassificationBatchTimesLoss(ClassificationLoss):
     Without random sampling, takes the first max_times candidates in their
     current order (sorted if unique_times=True). Repeated times otherwise
     contribute repeatedly to the loss. Candidate options are not validated.
+    Event-time extraction and optional deduplication still require dynamic
+    output sizes on CUDA. With only_event_times=False and unique_times=False,
+    grid selection uses no data-dependent host readback.
     """
-    def __init__(self, max_times=100, only_event_times=True, unique_times=False, random_sampling=False):
+    def __init__(self, max_times=100, only_event_times=True, unique_times=False, random_sampling=False, *, gpu_mode=False):
         r"""Initialize objective options and registered state.
 
         See Also
         --------
         ClassificationBatchTimesLoss : Constructor parameters and objective definition.
         """
-        super().__init__()
+        super().__init__(gpu_mode=gpu_mode)
         self.max_times = max_times
         self.only_event_times = only_event_times
         self.unique_times = unique_times
@@ -754,13 +812,17 @@ class ClassificationBatchTimesLoss(ClassificationLoss):
             Selected times; see the constructor selection rules.
         """
         t = times
-        if self.only_event_times and events.any():
-            t = t[events]
+        if self.only_event_times:
+            # nonzero synchronizes once on CUDA; its output length is then
+            # CPU-visible metadata, avoiding a separate events.any() read.
+            event_indices = events.nonzero(as_tuple=True)[0]
+            if event_indices.numel():
+                t = times.index_select(0, event_indices)
         if self.unique_times:
             t = torch.unique(t)
         if len(t) > self.max_times:
             if self.random_sampling:
-                t = t[torch.randperm(len(t))]
+                t = t[torch.randperm(len(t), device=t.device)]
             t = t[:self.max_times]
 
         return t
@@ -774,11 +836,16 @@ class ClassificationFixedTimesLoss(ClassificationLoss):
     times : torch.Tensor, shape (n_pred_times,), optional
         Shared evaluation times on the model device. A real tensor is
         required for evaluation despite the constructor default None.
+    gpu_mode : bool, default=False
+        Select the masked reduction when True or indexed mean when False;
+        see ClassificationLoss. Either path supports CPU or CUDA tensors.
 
     Attributes
     ----------
     times : torch.Tensor or None
         Ordinary attribute, not a registered buffer.
+    gpu : bool
+        Selected reduction path, initialized from gpu_mode.
 
     Notes
     -----
@@ -786,14 +853,14 @@ class ClassificationFixedTimesLoss(ClassificationLoss):
     Uses :class:`ClassificationLoss`; times are not converted or moved
     by module.to().
     """
-    def __init__(self, times=None):
+    def __init__(self, times=None, *, gpu_mode=False):
         r"""Initialize objective options and registered state.
 
         See Also
         --------
         ClassificationFixedTimesLoss : Constructor parameters and objective definition.
         """
-        super().__init__()
+        super().__init__(gpu_mode=gpu_mode)
         self.times = times
 
     def get_times(self, events, times):
@@ -827,7 +894,10 @@ class BrierBatchTimesLoss(ClassificationBatchTimesLoss):
         Remove duplicates before truncation using torch.unique.
     random_sampling : bool, default=False
         Randomly permute candidates before truncation when the count exceeds
-        max_times. Uses the global PyTorch RNG.
+        max_times. Uses the global PyTorch RNG on the time tensor's device.
+    gpu_mode : bool, default=False
+        Select the masked reduction when True or indexed mean when False;
+        see ClassificationLoss. Either path supports CPU or CUDA tensors.
 
     Notes
     -----
@@ -854,7 +924,7 @@ class BrierBatchTimesLoss(ClassificationBatchTimesLoss):
         Returns
         -------
         callable
-            PyTorch mean squared error.
+            PyTorch mean squared error, supporting reduction="none".
         """
         return torch.nn.functional.mse_loss
     #classification_loss = test_func
@@ -872,7 +942,10 @@ class BCEBatchTimesLoss(ClassificationBatchTimesLoss):
         Remove duplicates before truncation using torch.unique.
     random_sampling : bool, default=False
         Randomly permute candidates before truncation when the count exceeds
-        max_times. Uses the global PyTorch RNG.
+        max_times. Uses the global PyTorch RNG on the time tensor's device.
+    gpu_mode : bool, default=False
+        Select the masked reduction when True or indexed mean when False;
+        see ClassificationLoss. Either path supports CPU or CUDA tensors.
 
     Notes
     -----
@@ -906,7 +979,7 @@ class BCEBatchTimesLoss(ClassificationBatchTimesLoss):
         Returns
         -------
         callable
-            PyTorch binary cross entropy.
+            PyTorch binary cross entropy, supporting reduction="none".
         """
         return torch.nn.functional.binary_cross_entropy
 
