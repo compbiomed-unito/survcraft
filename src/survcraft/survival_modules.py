@@ -639,7 +639,9 @@ class ExponentialSurvivalModule(BaseSurvivalModule):
 
         E[T]=1/\lambda,\quad \operatorname{median}(T)=\log(2)/\lambda.
 
-    Risk is the rate itself. Failure uses 1 - S.
+    Risk is the rate itself. Failure uses 1 - S. If the rate underflows
+    to zero, mean and median remain infinite but their parameter gradients
+    are set to zero, allowing losses to discard those summaries safely.
 
     Uses the shapes, modes, and device contract in :class:`BaseSurvivalModule`.
     Inherited epsilon and enable_checks options are forwarded to that class.
@@ -748,8 +750,12 @@ class ExponentialSurvivalModule(BaseSurvivalModule):
         ExponentialSurvivalModule : Parameterization and implemented formulas.
         BaseSurvivalModule : Shared tensor and device contract.
         """
+        # Preserve the infinite summary at an underflowed rate without
+        # recording a division by zero in the backward graph.
         l = params["scale"].squeeze(-1)
-        return 1.0 / l
+        zero_rate = l == 0
+        safe_rate = l.masked_fill(zero_rate, 1.0)
+        return (1.0 / safe_rate).masked_fill(zero_rate, float("inf"))
 
     def median_time(self, params):
         r"""Return the median event time.
@@ -770,8 +776,12 @@ class ExponentialSurvivalModule(BaseSurvivalModule):
         ExponentialSurvivalModule : Parameterization and implemented formulas.
         BaseSurvivalModule : Shared tensor and device contract.
         """
+        # Preserve the infinite summary at an underflowed rate without
+        # recording a division by zero in the backward graph.
         l = params["scale"].squeeze(-1)
-        return self.ln2 / l
+        zero_rate = l == 0
+        safe_rate = l.masked_fill(zero_rate, 1.0)
+        return (self.ln2 / safe_rate).masked_fill(zero_rate, float("inf"))
 
     def risk(self, params):
         r"""Return a score whose larger values indicate earlier events.
@@ -830,6 +840,10 @@ class WeibullSurvivalModule(BaseSurvivalModule):
     Survival is exactly one at t=0, with zero parameter gradients. Scales
     below the dtype's smallest positive normal value are floored to that
     value before taking logs, including softplus outputs that underflow to zero.
+
+    At t=0, hazard uses its analytic limit: infinity for k < 1, 1/lambda
+    for k = 1, and zero for k > 1. The singular limit is treated as a
+    constant for differentiation.
 
     Density is forced to zero at t=0, even when the mathematical limit is
     nonzero or infinite. Survival clipping imposes a positive tail floor;
@@ -916,16 +930,12 @@ class WeibullSurvivalModule(BaseSurvivalModule):
         WeibullSurvivalModule : Parameterization and implemented formulas.
         BaseSurvivalModule : Shared tensor and device contract.
         """
-        l, k = params["scale"], params["shape"]
-        return torch.where(
-            times > 0.0,
-            self.hazard(params, times) * self.survival(params, times),
-            self.zero,
-        )
-        scaled_times = times / l
-        return (k / l) * torch.exp(
-            torch.xlogy(k - 1, scaled_times) - torch.pow(scaled_times, k)
-        )
+        # Do not evaluate the singular hazard at times whose density is
+        # defined to be zero: masking the product afterwards is too late.
+        positive_times = times > 0.0
+        safe_times = times.masked_fill(~positive_times, 1.0)
+        density = self.hazard(params, safe_times) * self.survival(params, safe_times)
+        return density.masked_fill(~positive_times, 0.0)
 
     def hazard(self, params, times):
         r"""Return the instantaneous hazard h(t).
@@ -949,7 +959,16 @@ class WeibullSurvivalModule(BaseSurvivalModule):
         BaseSurvivalModule : Shared tensor and device contract.
         """
         l, k = params["scale"], params["shape"]
-        return (k / l) * torch.pow(times / l, k - 1)
+        zero_times = times == 0
+        safe_times = times.masked_fill(zero_times, 1.0)
+        hazard = (k / l) * torch.pow(safe_times / l, k - 1)
+        # Use the analytic t=0 limits without differentiating 0**(k-1).
+        # The singular/infinite limit has zero parameter gradients; at
+        # k=1 the scale derivative of 1/l is retained.
+        unit_shape_scale = l.masked_fill(k != 1, 1.0)
+        zero_limit = torch.where(k == 1, 1.0 / unit_shape_scale, torch.zeros_like(l))
+        zero_limit = zero_limit.masked_fill(k < 1, float("inf"))
+        return torch.where(zero_times, zero_limit, hazard)
 
     def expected_time(self, params):
         r"""Return the expected event time.
