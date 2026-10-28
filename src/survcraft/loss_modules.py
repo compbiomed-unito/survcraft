@@ -306,32 +306,36 @@ def full_likelihood_reference(model, x, events, times, censoring_alpha, check_di
         return weight * loss_events + censoring_alpha * (1 - weight) * loss_censor
 
 
+def _likelihood_log(preds):
+    """Match nan_to_num(log(preds), nan=0, neginf=0) using safe operands."""
+    loggable = (preds > 0) & preds.isfinite()
+    result = preds.masked_fill(~loggable, 1.0).log()
+    # Keep the existing positive-infinity log value for the unchecked path.
+    return result.masked_fill(preds.isposinf(), torch.finfo(preds.dtype).max)
+
+
 def full_likelihood_multi(model, x, events, times, skip, gpu, censoring_alpha, check_divergence="raise"):
-    'has multiple paths optimized for cpu or gpu'
-    if gpu:
-        def func(mode, mask, skip):
-            # boolean indexing of tensors will cause a sync with gpu, so here we use masking instead
-            # sync is probably more expensive than doing more calculations and discarding what we do not need
+    """Evaluate likelihood with indexing on CPU or fixed-size masks on GPU."""
+    def func(mode, mask):
+        if gpu:
             preds = torch.diagonal(model(mode, x, times, check_divergence=check_divergence))
             if skip:
                 mask = mask & preds.isfinite()
-            # masked mean of logs
             n = mask.sum()
-            return -torch.nan_to_num(torch.log(preds) * mask, nan=0.0, neginf=0.0).sum() / n, n
-    else:
-        def func(mode, mask, skip):
-            # FIXME here we could avoid computing the whole matrix, maybe a loop on the diagonal would make sense on cpu
+            # Remove unused values before log, including zero probabilities.
+            preds = preds.masked_fill(~mask, 1.0)
+        else:
             preds = torch.diagonal(model(mode, x[mask], times[mask], check_divergence=check_divergence))
             if skip:
                 preds = preds[preds.isfinite()]
-            n = len(preds)
-            return -torch.nan_to_num(torch.log(preds), nan=0.0, neginf=0.0).sum() / n, len(preds)
+            n = preds.new_tensor(len(preds))
+        # An empty group contributes zero. An entirely discarded batch yields
+        # a non-finite scalar below so training can skip its optimizer step.
+        return -_likelihood_log(preds).sum(), n
 
-    loss_events, n_events = func("density", mask=events, skip=skip)
-    loss_censor, n_censor = func("survival", mask=~events, skip=skip)
-
-    weight = n_events / (n_events + n_censor)
-    return weight * loss_events + censoring_alpha * (1 - weight) * loss_censor
+    loss_events, n_events = func("density", events)
+    loss_censor, n_censor = func("survival", ~events)
+    return (loss_events + censoring_alpha * loss_censor) / (n_events + n_censor)
 
 
 class FullLikelihoodLoss(BaseSurvivalLoss):
@@ -341,11 +345,17 @@ class FullLikelihoodLoss(BaseSurvivalLoss):
     ----------
     censoring_alpha : float, default=1.0
         Nonnegative weight multiplying the censored likelihood contribution.
+    gpu_mode : bool or None, default=False
+        Use fixed-size masks when True, or index event/censor groups when
+        False. None selects the legacy reference implementation, which does
+        not support the skip policy.
 
     Attributes
     ----------
     censoring_alpha : float
         Weight of the censored term.
+    gpu : bool or None
+        Selected evaluation path.
 
     Raises
     ------
@@ -359,13 +369,21 @@ class FullLikelihoodLoss(BaseSurvivalLoss):
     .. math::
 
         L=-\frac1N\sum_i\left[
-            e_i\log\max(f_i(t_i),10^{-12})
-            +\alpha(1-e_i)\log\max(S_i(t_i),10^{-12})\right].
+            e_i\ell(f_i(t_i))
+            +\alpha(1-e_i)\ell(S_i(t_i))\right].
 
-    The implementation averages event and censor groups separately and
-    weights them by their batch proportions. Empty-group means become zero
-    through nan_to_num; nonempty NaN means are also replaced by zero.
-    Requests density and survival matrices and uses their diagonals.
+    The default and masked paths use ell(p) = nan_to_num(log(p), nan=0,
+    neginf=0), preserving
+    zero contributions for nonpositive or NaN probabilities and a finite
+    maximum log value for positive infinity. Unsafe logarithms are
+    avoided before evaluation. Empty groups contribute zero. Under skip,
+    non-finite probabilities are omitted and N counts retained individuals;
+    no retained individuals produces a NaN loss for the trainer to skip.
+    Output filtering cannot repair invalid upstream model computations.
+
+    The legacy reference path instead uses a probability floor of 1e-12,
+    averages event and censor groups separately, and replaces NaN means
+    with zero. All paths request matrices and use their diagonals.
     Uses the :class:`BaseSurvivalLoss` contract.
     """
     def __init__(self, censoring_alpha: float = 1.0, gpu_mode : bool = False):
