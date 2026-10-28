@@ -45,7 +45,6 @@ def test_default_simulator_and_predictor_training_parameters_work_together(histo
     predictor.fit(X, y, X_test=X[:16], y_test=y[:16])
 
     assert hasattr(predictor, "model_")
-    assert predictor.model_.check_divergence == check_divergence
     if history:
         assert 1 <= len(predictor.train_history_) <= predictor.epochs
         for train_losses, test_losses in predictor.train_history_:

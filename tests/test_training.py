@@ -6,6 +6,41 @@ import pytest
 import torch
 
 from survcraft import adapters as ad
+from survcraft.loss_modules import BaseSurvivalLoss
+
+
+class BufferedLoss(BaseSurvivalLoss):
+    def __init__(self, scale):
+        super().__init__()
+        self.register_buffer("scale", torch.tensor(scale))
+
+    def forward(self, model, X, event, time, *, check_divergence="raise"):
+        assert self.scale.device == X.device
+        if model.training:
+            return self.scale * model.get_raw_params(X).square().mean()
+        return self.scale * len(X)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda:0"])
+def test_loss_buffers_and_validation_batch_mean(device, capsys):
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    loss = BufferedLoss(0.5) + BufferedLoss(0.5)
+    test_loss = BufferedLoss(2.0)
+    predictor = ad.SurvivalPredictor(
+        loss=loss, device=device, epochs=1, batch_size=2,
+        early_stopping=True, validation_ratio=0.375, history=True, verbose=3,
+    )
+    X = np.ones((8, 2), dtype=np.float32)
+    event = np.ones(8, dtype=bool)
+    time = np.ones(8, dtype=np.float32)
+    predictor.train(X, event, time, test_data=(X, event, time), test_losses=[test_loss])
+
+    assert all(buffer.device == torch.device(device) for buffer in loss.buffers())
+    assert test_loss.scale.device == torch.device(device)
+    # Validation has batches of sizes 2 and 1: preserve their unweighted mean.
+    assert "validation loss = 1.5" in capsys.readouterr().out
+    assert predictor.train_history_[0][1] == {"BufferedLoss": 16.0}
 
 
 class ScheduledValidationLoss:
@@ -14,7 +49,7 @@ class ScheduledValidationLoss:
         self.training_states = []
         self.training_calls = 0
 
-    def __call__(self, model, X, event, time):
+    def __call__(self, model, X, event, time, *, check_divergence="raise"):
         if model.training:
             self.training_calls += 1
             self.training_states.append(copy.deepcopy(model.state_dict()))
@@ -76,7 +111,7 @@ class BatchLoss:
         self.nonfinite_samples = nonfinite_samples
         self.calls = 0
 
-    def __call__(self, model, X, event, time):
+    def __call__(self, model, X, event, time, *, check_divergence="raise"):
         self.calls += 1
         if X[0, 0].item() in self.nonfinite_samples:
             return torch.tensor(float("nan"))
@@ -96,12 +131,13 @@ class BatchLoss:
     ],
 )
 @pytest.mark.parametrize("bulk_batching", [False, True])
-def test_skipped_batches_report_the_actual_reasons(events, nonfinite_samples, expected, failed, bulk_batching):
+@pytest.mark.parametrize("policy", ["warn", "skip"])
+def test_skipped_batches_report_the_actual_reasons(events, nonfinite_samples, expected, failed, bulk_batching, policy):
     X = np.arange(len(events), dtype=np.float32).reshape(-1, 1)
     loss = BatchLoss(nonfinite_samples)
     predictor = ad.SurvivalPredictor(loss=loss, epochs=1, batch_size=1,
                                      device="cpu", verbose=0, history=True,
-                                     bulk_batching=bulk_batching)
+                                     bulk_batching=bulk_batching, check_divergence=policy)
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -133,6 +169,42 @@ def test_zero_epochs_with_early_stopping_does_not_restore_missing_state():
     assert hasattr(predictor, "model_")
 
 
+def test_no_divergence_checks_optimizes_nonfinite_loss():
+    def nonfinite_loss(model, X, event, time, *, check_divergence="raise"):
+        return model.get_raw_params(X).square().mean() + float("nan")
+
+    predictor = ad.SurvivalPredictor(
+        loss=nonfinite_loss, check_divergence="no", epochs=1,
+        batch_size=4, history=True, device="cpu", verbose=0,
+    )
+    X = np.ones((4, 2), dtype=np.float32)
+    predictor._init_model(X)
+    before = copy.deepcopy(predictor.model_.state_dict())
+    predictor.train_history_ = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        predictor.train(X, np.ones(4, dtype=bool), np.ones(4), warm_start=True)
+
+    assert not caught
+    assert np.isnan(predictor.train_history_[0][0]).all()
+    assert any(not torch.equal(value, before[key])
+               for key, value in predictor.model_.state_dict().items())
+
+
+def test_raise_policy_rejects_nonfinite_loss_before_update():
+    predictor = ad.SurvivalPredictor(
+        loss=BatchLoss((0,)), check_divergence="raise", epochs=1, device="cpu",
+    )
+    X = np.zeros((4, 2), dtype=np.float32)
+    predictor._init_model(X)
+    predictor.train_history_ = []
+    before = copy.deepcopy(predictor.model_.state_dict())
+    with pytest.raises(ad.FailedConvergence, match="non-finite loss"):
+        predictor.train(X, np.ones(4, dtype=bool), np.ones(4), warm_start=True)
+    for key, value in predictor.model_.state_dict().items():
+        torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("early_stopping", [False, True])
 @pytest.mark.parametrize("device,preload_data,num_workers", [
     ("cpu", False, 0),
@@ -154,7 +226,7 @@ def test_bulk_batching_preserves_batches_weights_and_history(early_stopping, dev
         torch.manual_seed(123)
         batches = []
 
-        def recording_loss(model, Xb, eb, tb):
+        def recording_loss(model, Xb, eb, tb, *, check_divergence="raise"):
             batches.append((model.training, tuple(t.detach().cpu().clone()
                                                   for t in (Xb, eb, tb))))
             return model.get_raw_params(Xb).square().mean()

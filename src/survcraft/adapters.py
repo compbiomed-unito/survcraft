@@ -32,7 +32,7 @@ import math
 import functools
 
 
-CheckDivergence = Literal["warn", "raise", "no"]
+CheckDivergence = Literal["warn", "raise", "skip", "no"]
 TensorPrediction = Union[Tensor, dict[str, Tensor]]
 ArrayPrediction = Union[numpy.ndarray, dict[str, numpy.ndarray]]
 Method = TypeVar("Method", bound=Callable[..., Any])
@@ -675,7 +675,7 @@ def shape2str(x: Union[Tensor, numpy.ndarray]) -> str:
     return 'x'.join(map(str, x.shape))
 
 
-check_divergence_values: tuple[CheckDivergence, ...] = "warn", "raise", "no"
+check_divergence_values: tuple[CheckDivergence, ...] = "warn", "raise", "skip", "no"
 class TorchModel(torch.nn.Module):
     r"""Compose a feature map and a survival distribution module.
 
@@ -685,8 +685,6 @@ class TorchModel(torch.nn.Module):
         Feature-to-raw-parameter map following :class:`BaseInputAdapter`.
     survival_module : survcraft.survival_modules.BaseSurvivalModule
         Distribution module following :class:`BaseSurvivalAdapter`.
-    check_divergence : {"raise", "warn", "no"}, default="raise"
-        Policy for non-finite raw parameters and predictions.
 
     Attributes
     ----------
@@ -694,11 +692,6 @@ class TorchModel(torch.nn.Module):
         Registered feature map.
     survival_module : survcraft.survival_modules.BaseSurvivalModule
         Registered distribution module.
-
-    Raises
-    ------
-    ValueError
-        If the divergence policy is unknown.
 
     Notes
     -----
@@ -710,9 +703,8 @@ class TorchModel(torch.nn.Module):
         self,
         input_module: Module,
         survival_module: survival_modules.BaseSurvivalModule,
-        check_divergence: CheckDivergence = "raise",
     ) -> None:
-        r"""Initialize the two registered modules and divergence policy.
+        r"""Initialize the two registered modules.
 
         See Also
         --------
@@ -721,9 +713,6 @@ class TorchModel(torch.nn.Module):
         super().__init__()
         self.input_module = input_module
         self.survival_module = survival_module
-        if check_divergence not in check_divergence_values:
-            raise ValueError(f"unknown value {check_divergence} for `check_divergence`, must be one of {check_divergence_values}")
-        self.check_divergence = check_divergence
 
     def get_raw_params(self, x: Tensor) -> Tensor:
         r"""Compute unconstrained distribution parameters.
@@ -765,8 +754,9 @@ class TorchModel(torch.nn.Module):
         name: str,
         times: Optional[Tensor] = None,
         context: Mapping[str, Any] = {},
+        check_divergence: CheckDivergence = "raise",
     ) -> None:
-        r"""Apply the configured policy to non-finite tensor values.
+        r"""Apply the per-call policy to non-finite tensor values.
 
         Parameters
         ----------
@@ -778,6 +768,8 @@ class TorchModel(torch.nn.Module):
             Scalar or vector of associated prediction times.
         context : mapping, optional
             Additional diagnostic values attached to a raised exception.
+        check_divergence : {"raise", "warn", "no"}, default="raise"
+            Policy to apply during this call.
 
         Returns
         -------
@@ -794,7 +786,7 @@ class TorchModel(torch.nn.Module):
         The warn policy emits a warning. Raised exceptions include a dict
         of tensor values and context as their second argument.
         """
-        if self.check_divergence != "no":
+        if check_divergence in {"warn", "raise"}:
             x_fail = ~x.isfinite()
             if x_fail.any():
                 desc = f"non-finite value(s) in {name}: {x.isinf().sum()}inf+{x.isnan().sum()}nan/{shape2str(x)}tot"
@@ -808,15 +800,16 @@ class TorchModel(torch.nn.Module):
                     bad_time_head = ', '.join(map(str, bad_times[:5].tolist()))
                     if len(bad_times) > 5: bad_time_head += '...'
                     desc += f", for {bad_sample_num} samples at {len(bad_times)} times ({bad_time_head})"
-                if self.check_divergence == "raise":
+                if check_divergence == "raise":
                     ctx = {"tensor_name": name, "tensor_values": x.detach().cpu(), "times": times}
                     ctx.update(context)
                     raise ValueError(desc, ctx)
-                elif self.check_divergence == "warn":
+                elif check_divergence == "warn":
                     warnings.warn(desc)
 
     def forward(
-        self, mode: str, x: Tensor, times: Optional[Tensor] = None
+        self, mode: str, x: Tensor, times: Optional[Tensor] = None,
+        *, check_divergence: CheckDivergence = "raise"
     ) -> TensorPrediction:
         r"""Predict a distribution quantity and check for non-finite values.
 
@@ -828,6 +821,9 @@ class TorchModel(torch.nn.Module):
             Features on the model device.
         times : torch.Tensor, scalar or shape (n_times,), optional
             Shared evaluation times for time-dependent modes.
+        check_divergence : {"raise", "warn", "skip", "no"}, default="raise"
+            Per-call policy for non-finite raw parameters and predictions.
+            Individual skipping is handled by losses; "skip" disables checks here.
 
         Returns
         -------
@@ -844,18 +840,21 @@ class TorchModel(torch.nn.Module):
         --------
         survcraft.survival_modules.BaseSurvivalModule.forward : Mode validation.
         """
+        if check_divergence not in check_divergence_values:
+            raise ValueError(f"unknown check_divergence policy: {check_divergence}")
+
         # run the input and survival modules
         params = self.input_module(x)
         preds = self.survival_module(mode, params, times)
 
         # do checks if needed
-        if self.check_divergence in {"warn", "raise"}:
-            self._check_tensor(params, name="raw params") # times not needed since params are not indexed by times
+        if check_divergence in {"warn", "raise"}:
+            self._check_tensor(params, name="raw params", check_divergence=check_divergence) # times not needed since params are not indexed by times
             if mode == "params":
                 for name, values in preds.items():
-                    self._check_tensor(values, name=f"params[{name}]", context={"raw_params": params})
+                    self._check_tensor(values, name=f"params[{name}]", context={"raw_params": params}, check_divergence=check_divergence)
             else:
-                self._check_tensor(preds, name=mode, times=times, context={"raw_params": params})
+                self._check_tensor(preds, name=mode, times=times, context={"raw_params": params}, check_divergence=check_divergence)
 
         return preds
 
@@ -913,8 +912,10 @@ class SurvivalEstimator(BaseEstimator):
         is randomly chosen and cached on first use, not distributed across.
     verbose : int, default=0
         Training output level: 0 is quiet, 1 periodic, 2 per epoch, 3 per batch.
-    check_divergence : {'raise', 'warn', 'no'}, default='raise'
-        Policy for non-finite raw parameters and predictions.
+    check_divergence : {'raise', 'warn', 'skip', 'no'}, default='raise'
+        Policy passed to losses and model prediction calls. Skip omits
+        individuals with non-finite predictions within losses; prediction
+        calls preserve all rows and disable checks for this policy.
 
     Attributes
     ----------
@@ -1119,6 +1120,8 @@ class SurvivalEstimator(BaseEstimator):
         The input output width comes from survival_module.get_param_number().
         Requires input and survival adapters to be configured.
         """
+        if self.check_divergence not in check_divergence_values:
+            raise ValueError(f"unknown check_divergence policy: {self.check_divergence}")
         survival_module = self.survival.get_module(
             event=event,
             time=time,
@@ -1129,7 +1132,6 @@ class SurvivalEstimator(BaseEstimator):
                 output_size=survival_module.get_param_number(),
             ),
             survival_module=survival_module,
-            check_divergence=self.check_divergence,
         ).to(self._get_device())
 
     def fit(self, X: numpy.ndarray, y: numpy.ndarray) -> SurvivalEstimator:
@@ -1231,6 +1233,7 @@ class SurvivalEstimator(BaseEstimator):
                     mode,
                     self._tensor(X),
                     None if times is None else self._tensor(times),
+                    check_divergence=self.check_divergence,
                 )
         if mode == 'params':
             return {k: p.detach().cpu().numpy() for k, p in result.items()}
@@ -1280,14 +1283,17 @@ class SurvivalPredictor(SurvivalEstimator):
         Distribution factory; defaults to a new ExponentialSurvivalAdapter.
         This adapter and its nested adapters must have simulation_only=False.
     loss : survcraft.loss_modules.BaseSurvivalLoss, optional
-        Training objective; defaults to a new BrierLoss.
+        Training objective; defaults to a new BrierLoss. Custom callables must
+        accept ``(model, x, event, time, *, check_divergence="raise")``.
     device : str or sequence of str, default='cpu'
         PyTorch device or nonempty list of candidate devices. One candidate
         is randomly chosen and cached on first use, not distributed across.
     verbose : int, default=0
         Training output level: 0 is quiet, 1 periodic, 2 per epoch, 3 per batch.
-    check_divergence : {'raise', 'warn', 'no'}, default='raise'
-        Policy for non-finite raw parameters and predictions.
+    check_divergence : {'raise', 'warn', 'skip', 'no'}, default='raise'
+        Policy passed to losses and model prediction calls. Skip omits
+        individuals with non-finite predictions within losses; prediction
+        calls preserve all rows and disable checks for this policy.
     batch_size : int, default=256
         Training and validation mini-batch size.
     bulk_batching : bool, default=True
@@ -1649,7 +1655,7 @@ class SurvivalPredictor(SurvivalEstimator):
                     eb = eb.to(transfer_batches_to)
                     tb = tb.to(transfer_batches_to)
 
-                loss = self.loss(self.model_, Xb, eb, tb)
+                loss = self.loss(self.model_, Xb, eb, tb, check_divergence=self.check_divergence)
                 if self.check_divergence != "no":
                     loss_num = loss.item()
                     if not math.isfinite(loss_num):
@@ -1701,7 +1707,7 @@ class SurvivalPredictor(SurvivalEstimator):
                             Xb = Xb.to(transfer_batches_to)
                             eb = eb.to(transfer_batches_to)
                             tb = tb.to(transfer_batches_to)
-                        val_loss = self.loss(self.model_, Xb, eb, tb)
+                        val_loss = self.loss(self.model_, Xb, eb, tb, check_divergence=self.check_divergence)
                         epoch_val_losses[batch] = val_loss
                     mean_val_loss = torch.mean(epoch_val_losses).item()
 
@@ -1735,7 +1741,8 @@ class SurvivalPredictor(SurvivalEstimator):
                 with torch.no_grad():
                     test_losses_vals = {
                         lf.__class__.__name__: lf(
-                            self.model_, X_test, event_test, time_test
+                            self.model_, X_test, event_test, time_test,
+                            check_divergence=self.check_divergence,
                         ).item()
                         for lf in test_losses
                     }
@@ -1809,8 +1816,10 @@ class SurvivalSimulator(SurvivalEstimator):
         is randomly chosen and cached on first use, not distributed across.
     verbose : int, default=0
         Training output level: 0 is quiet, 1 periodic, 2 per epoch, 3 per batch.
-    check_divergence : {'raise', 'warn', 'no'}, default='raise'
-        Policy for non-finite raw parameters and predictions.
+    check_divergence : {'raise', 'warn', 'skip', 'no'}, default='raise'
+        Policy passed to losses and model prediction calls. Skip omits
+        individuals with non-finite predictions within losses; prediction
+        calls preserve all rows and disable checks for this policy.
 
     Attributes
     ----------

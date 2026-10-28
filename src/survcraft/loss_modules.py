@@ -65,6 +65,20 @@ def check_survival_outcomes(events, times):
         )
 
 
+def _run_model_and_mask(model, mode, x, times=None):
+    preds = model(mode, x, times)
+    retained = preds.isfinite().any(dim=1)
+    return preds, retained
+
+def _predict_with_mask(model, mode, x, times=None, check_divergence="raise"):
+    policy = "no" if check_divergence == "skip" else check_divergence
+    preds = model(mode, x, times, check_divergence=policy)
+    if check_divergence == "skip":
+        retained = torch.isfinite(preds).reshape(len(x), -1).all(dim=1)
+    else:
+        retained = None
+    return preds, retained
+
 class BaseSurvivalLoss(torch.nn.Module, abc.ABC):
     r"""Define scalar model-aware losses and arithmetic composition.
 
@@ -106,13 +120,13 @@ class BaseSurvivalLoss(torch.nn.Module, abc.ABC):
     survcraft.adapters.SurvivalPredictor : Mini-batch optimization.
     """
     @abc.abstractmethod
-    def forward(self, model: torch.nn.Module, x: Tensor, event: torch.BoolTensor, time: Tensor):
+    def forward(self, model: torch.nn.Module, x: Tensor, event: torch.BoolTensor, time: Tensor, *, check_divergence: str = "raise"):
         r"""Compute a scalar objective by requesting model predictions.
 
         Parameters
         ----------
         model : torch.nn.Module
-            Callable ``model(mode, x, times=None)`` following the prediction
+            Callable ``model(mode, x, times=None, *, check_divergence="raise")`` following the prediction
             contract of survcraft.adapters.TorchModel.
         x : torch.Tensor, shape (n_samples, n_features)
             Floating feature matrix on the model device.
@@ -120,6 +134,10 @@ class BaseSurvivalLoss(torch.nn.Module, abc.ABC):
             True for an observed event, False for right censoring.
         time : torch.Tensor, shape (n_samples,)
             Finite nonnegative event or censoring times on the model device.
+        check_divergence : {"raise", "warn", "skip", "no"}, default="raise"
+            Forward warn/raise checks to the model, omit non-finite individuals
+            for skip, or disable checks for no. Output filtering alone does not
+            guarantee finite gradients.
 
         Returns
         -------
@@ -231,13 +249,13 @@ class LinearCombinationLoss(BaseSurvivalLoss):
             coeff_acc.append(c * cc)
         self.register_buffer("coeffs", torch.cat(coeff_acc))
 
-    def forward(self, model, x, event, time):
+    def forward(self, model, x, event, time, *, check_divergence="raise"):
         r"""Compute the scalar objective defined by this loss.
 
         Parameters
         ----------
         model : torch.nn.Module
-            Callable ``model(mode, x, times=None)`` following the prediction
+            Callable ``model(mode, x, times=None, *, check_divergence="raise")`` following the prediction
             contract of survcraft.adapters.TorchModel.
         x : torch.Tensor, shape (n_samples, n_features)
             Floating feature matrix on the model device.
@@ -245,6 +263,10 @@ class LinearCombinationLoss(BaseSurvivalLoss):
             True for an observed event, False for right censoring.
         time : torch.Tensor, shape (n_samples,)
             Finite nonnegative event or censoring times on the model device.
+        check_divergence : {"raise", "warn", "skip", "no"}, default="raise"
+            Forward warn/raise checks to the model, omit non-finite individuals
+            for skip, or disable checks for no. Output filtering alone does not
+            guarantee finite gradients.
 
         Returns
         -------
@@ -259,7 +281,7 @@ class LinearCombinationLoss(BaseSurvivalLoss):
         """
         acc = torch.zeros_like(self.coeffs)
         for i, l in enumerate(self.losses):
-            acc[i] = l(model, x, event, time)
+            acc[i] = l(model, x, event, time, check_divergence=check_divergence)
         return torch.dot(acc, self.coeffs)
 
     def __str__(self):
@@ -271,6 +293,46 @@ class LinearCombinationLoss(BaseSurvivalLoss):
             Coefficients and component descriptions joined by plus signs.
         """
         return " + ".join(f"{c} * {l}" for l, c in zip(self.losses, self.coeffs))
+
+def full_likelihood_reference(model, x, events, times, censoring_alpha, check_divergence="raise"):
+        p_events = model("density", x[events], times[events], check_divergence=check_divergence)
+        loss_events = -torch.nan_to_num(torch.mean(safe_log(torch.diagonal(p_events))), nan=0.0)
+
+        p_censor = model("survival", x[~events], times[~events], check_divergence=check_divergence)
+        loss_censor = -torch.nan_to_num(torch.mean(safe_log(torch.diagonal(p_censor))), nan=0.0)
+
+        weight = events.float().mean()
+
+        return weight * loss_events + censoring_alpha * (1 - weight) * loss_censor
+
+
+def full_likelihood_multi(model, x, events, times, skip, gpu, censoring_alpha, check_divergence="raise"):
+    'has multiple paths optimized for cpu or gpu'
+    if gpu:
+        def func(mode, mask, skip):
+            # boolean indexing of tensors will cause a sync with gpu, so here we use masking instead
+            # sync is probably more expensive than doing more calculations and discarding what we do not need
+            preds = torch.diagonal(model(mode, x, times, check_divergence=check_divergence))
+            if skip:
+                mask = mask & preds.isfinite()
+            # masked mean of logs
+            n = mask.sum()
+            return -torch.nan_to_num(torch.log(preds) * mask, nan=0.0, neginf=0.0).sum() / n, n
+    else:
+        def func(mode, mask, skip):
+            # FIXME here we could avoid computing the whole matrix, maybe a loop on the diagonal would make sense on cpu
+            preds = torch.diagonal(model(mode, x[mask], times[mask], check_divergence=check_divergence))
+            if skip:
+                preds = preds[preds.isfinite()]
+            n = len(preds)
+            return -torch.nan_to_num(torch.log(preds), nan=0.0, neginf=0.0).sum() / n, len(preds)
+
+    loss_events, n_events = func("density", mask=events, skip=skip)
+    loss_censor, n_censor = func("survival", mask=~events, skip=skip)
+
+    weight = n_events / (n_events + n_censor)
+    return weight * loss_events + censoring_alpha * (1 - weight) * loss_censor
+
 
 class FullLikelihoodLoss(BaseSurvivalLoss):
     r"""Minimize negative event-density and censor-survival log likelihood.
@@ -306,7 +368,7 @@ class FullLikelihoodLoss(BaseSurvivalLoss):
     Requests density and survival matrices and uses their diagonals.
     Uses the :class:`BaseSurvivalLoss` contract.
     """
-    def __init__(self, censoring_alpha: float = 1.0):
+    def __init__(self, censoring_alpha: float = 1.0, gpu_mode : bool = False):
         r"""Initialize objective options and registered state.
 
         See Also
@@ -321,13 +383,15 @@ class FullLikelihoodLoss(BaseSurvivalLoss):
             raise ValueError(f'censoring alpha must be non negative, got {censoring_alpha}')
         self.censoring_alpha = censoring_alpha
 
-    def forward(self, model, x, events, times):
+        self.gpu = gpu_mode
+
+    def forward(self, model, x, events, times, *, check_divergence="raise"):
         r"""Compute the scalar objective defined by this loss.
 
         Parameters
         ----------
         model : torch.nn.Module
-            Callable ``model(mode, x, times=None)`` following the prediction
+            Callable ``model(mode, x, times=None, *, check_divergence="raise")`` following the prediction
             contract of survcraft.adapters.TorchModel.
         x : torch.Tensor, shape (n_samples, n_features)
             Floating feature matrix on the model device.
@@ -335,6 +399,8 @@ class FullLikelihoodLoss(BaseSurvivalLoss):
             True for an observed event, False for right censoring.
         times : torch.Tensor, shape (n_samples,)
             Finite nonnegative event or censoring times on the model device.
+        check_divergence : {"raise", "warn", "skip", "no"}, default="raise"
+            Per-call policy following :meth:`BaseSurvivalLoss.forward`.
 
         Returns
         -------
@@ -356,15 +422,14 @@ class FullLikelihoodLoss(BaseSurvivalLoss):
         """
         check_survival_outcomes(events, times)
 
-        p_events = model("density", x[events], times[events])
-        loss_events = -torch.nan_to_num(torch.mean(safe_log(torch.diagonal(p_events))), nan=0.0)
+        skip = check_divergence == "skip"
+        policy = "no" if skip else check_divergence
+        if self.gpu is None:
+            assert not skip
+            return full_likelihood_reference(model, x, events, times, self.censoring_alpha, policy)
+        else:
+            return full_likelihood_multi(model, x, events, times, skip, self.gpu, self.censoring_alpha, policy)
 
-        p_censor = model("survival", x[~events], times[~events])
-        loss_censor = -torch.nan_to_num(torch.mean(safe_log(torch.diagonal(p_censor))), nan=0.0)
-
-        weight = events.float().mean()
-
-        return weight * loss_events + self.censoring_alpha * (1 - weight) * loss_censor
 
 def brier(preds, pred_times, events, times):
     r"""Compute mean squared failure-probability error on informative pairs.
@@ -434,13 +499,13 @@ class BrierLoss(BaseSurvivalLoss):
     --------
     BrierBatchTimesLoss : Configurable batch time selection.
     """
-    def forward(self, model, x, events, times):
+    def forward(self, model, x, events, times, *, check_divergence="raise"):
         r"""Compute the scalar objective defined by this loss.
 
         Parameters
         ----------
         model : torch.nn.Module
-            Callable ``model(mode, x, times=None)`` following the prediction
+            Callable ``model(mode, x, times=None, *, check_divergence="raise")`` following the prediction
             contract of survcraft.adapters.TorchModel.
         x : torch.Tensor, shape (n_samples, n_features)
             Floating feature matrix on the model device.
@@ -448,6 +513,8 @@ class BrierLoss(BaseSurvivalLoss):
             True for an observed event, False for right censoring.
         times : torch.Tensor, shape (n_samples,)
             Finite nonnegative event or censoring times on the model device.
+        check_divergence : {"raise", "warn", "skip", "no"}, default="raise"
+            Per-call policy following :meth:`BaseSurvivalLoss.forward`.
 
         Returns
         -------
@@ -470,7 +537,10 @@ class BrierLoss(BaseSurvivalLoss):
         check_survival_outcomes(events, times)
 
         utimes = torch.unique(times[events] if events.any() else times)
-        preds = model("failure", x, utimes)
+        preds, retained = _predict_with_mask(model, "failure", x, utimes, check_divergence=check_divergence)
+        if retained is not None:
+            preds = preds[retained]
+            events, times = events[retained], times[retained]
         return brier(preds, utimes, events, times)
 
 
@@ -564,13 +634,13 @@ class ClassificationLoss(BaseSurvivalLoss):
         """
         ...
 
-    def forward(self, model, x, events, times):
+    def forward(self, model, x, events, times, *, check_divergence="raise"):
         r"""Compute the scalar objective defined by this loss.
 
         Parameters
         ----------
         model : torch.nn.Module
-            Callable ``model(mode, x, times=None)`` following the prediction
+            Callable ``model(mode, x, times=None, *, check_divergence="raise")`` following the prediction
             contract of survcraft.adapters.TorchModel.
         x : torch.Tensor, shape (n_samples, n_features)
             Floating feature matrix on the model device.
@@ -578,6 +648,8 @@ class ClassificationLoss(BaseSurvivalLoss):
             True for an observed event, False for right censoring.
         times : torch.Tensor, shape (n_samples,)
             Finite nonnegative event or censoring times on the model device.
+        check_divergence : {"raise", "warn", "skip", "no"}, default="raise"
+            Per-call policy following :meth:`BaseSurvivalLoss.forward`.
 
         Returns
         -------
@@ -601,7 +673,10 @@ class ClassificationLoss(BaseSurvivalLoss):
 
         # get predictions at appropriate times
         pred_times = self.get_times(events, times)
-        preds = model("failure", x, pred_times)
+        preds, retained = _predict_with_mask(model, "failure", x, pred_times, check_divergence=check_divergence)
+        if retained is not None:
+            preds = preds[retained]
+            events, times = events[retained], times[retained]
 
         # mask non informative outcomes
         mask = (times.unsqueeze(-1) > pred_times) | events.unsqueeze(-1)
@@ -836,13 +911,13 @@ class SquaredLoss(BaseSurvivalLoss):
     Requests expected_time; the distribution must implement a finite mean.
     Uses the :class:`BaseSurvivalLoss` contract.
     """
-    def forward(self, model, x, events, times):
+    def forward(self, model, x, events, times, *, check_divergence="raise"):
         r"""Compute the scalar objective defined by this loss.
 
         Parameters
         ----------
         model : torch.nn.Module
-            Callable ``model(mode, x, times=None)`` following the prediction
+            Callable ``model(mode, x, times=None, *, check_divergence="raise")`` following the prediction
             contract of survcraft.adapters.TorchModel.
         x : torch.Tensor, shape (n_samples, n_features)
             Floating feature matrix on the model device.
@@ -850,6 +925,8 @@ class SquaredLoss(BaseSurvivalLoss):
             True for an observed event, False for right censoring.
         times : torch.Tensor, shape (n_samples,)
             Finite nonnegative event or censoring times on the model device.
+        check_divergence : {"raise", "warn", "skip", "no"}, default="raise"
+            Per-call policy following :meth:`BaseSurvivalLoss.forward`.
 
         Returns
         -------
@@ -870,7 +947,10 @@ class SquaredLoss(BaseSurvivalLoss):
         BaseSurvivalLoss : Shared model, tensor, and device contracts.
         """
         check_survival_outcomes(events, times)
-        preds = model("expected_time", x)
+        preds, retained = _predict_with_mask(model, "expected_time", x, check_divergence=check_divergence)
+        if retained is not None:
+            preds = preds[retained]
+            events, times = events[retained], times[retained]
         return squared_loss(preds, events, times)
 
 
@@ -882,7 +962,7 @@ def partial_likelihood_iter(model, x, events, times):
     Parameters
     ----------
     model : torch.nn.Module
-        Callable ``model(mode, x, times=None)`` following the prediction
+        Callable ``model(mode, x, times=None, *, check_divergence="raise")`` following the prediction
         contract of survcraft.adapters.TorchModel.
     x : torch.Tensor, shape (n_samples, n_features)
         Floating feature matrix on the model device.
@@ -920,7 +1000,7 @@ def partial_likelihood_vec(model, x, event, time, epsilon):
     Parameters
     ----------
     model : torch.nn.Module
-        Callable ``model(mode, x, times=None)`` following the prediction
+        Callable ``model(mode, x, times=None, *, check_divergence="raise")`` following the prediction
         contract of survcraft.adapters.TorchModel.
     x : torch.Tensor, shape (n_samples, n_features)
         Floating feature matrix on the model device.
@@ -972,17 +1052,18 @@ def safe_log(x, epsilon=1e-12):
     -----
     NaNs remain NaN. Values below the floor have zero clamp gradient.
     """
+    # FIXME this move to device could be avoided
     epsilon = epsilon.to(x.device) if isinstance(epsilon, Tensor) else torch.tensor(epsilon, device=x.device)
     return torch.log(torch.clamp(x, min=epsilon))
 
 
-def partial_likelihood_vec_safe(model, x, event, time, epsilon):
+def partial_likelihood_vec_safe(model, x, event, time, epsilon, check_divergence="raise"):
     r"""Compute a stable summed hazard partial likelihood.
 
     Parameters
     ----------
     model : torch.nn.Module
-        Callable ``model(mode, x, times=None)`` following the prediction
+        Callable ``model(mode, x, times=None, *, check_divergence="raise")`` following the prediction
         contract of survcraft.adapters.TorchModel.
     x : torch.Tensor, shape (n_samples, n_features)
         Floating feature matrix on the model device.
@@ -1018,8 +1099,16 @@ def partial_likelihood_vec_safe(model, x, event, time, epsilon):
         return torch.zeros((), dtype=time.dtype, device=time.device)
 
     event_times = time[event]
+    hazard, retained = _predict_with_mask(model, "hazard", x, event_times, check_divergence=check_divergence)
+    if retained is not None:
+        event_columns = retained[event]
+        hazard = hazard[retained][:, event_columns]
+        event_times = event_times[event_columns]
+        time, event = time[retained], event[retained]
+        if not event.any():
+            return hazard.sum() * float("nan")
     risk_sets = time.unsqueeze(-1) >= event_times
-    log_hazard = safe_log(model("hazard", x, event_times), epsilon)
+    log_hazard = safe_log(hazard, epsilon)
 
     top = torch.diag(log_hazard[event])
     masked_log_hazard = log_hazard.masked_fill(~risk_sets, float("-inf"))
@@ -1039,7 +1128,7 @@ def partial_likelihood_sorted(model, x, event, time, epsilon):
     Parameters
     ----------
     model : torch.nn.Module
-        Callable ``model(mode, x, times=None)`` following the prediction
+        Callable ``model(mode, x, times=None, *, check_divergence="raise")`` following the prediction
         contract of survcraft.adapters.TorchModel.
     x : torch.Tensor, shape (n_samples, n_features)
         Floating feature matrix on the model device.
@@ -1116,13 +1205,13 @@ class PartialLikelihoodLoss(BaseSurvivalLoss):
         super().__init__()
         self.register_buffer("epsilon", torch.tensor(epsilon, dtype=torch.float32))
 
-    def forward(self, model, x, events, times):
+    def forward(self, model, x, events, times, *, check_divergence="raise"):
         r"""Compute the scalar objective defined by this loss.
 
         Parameters
         ----------
         model : torch.nn.Module
-            Callable ``model(mode, x, times=None)`` following the prediction
+            Callable ``model(mode, x, times=None, *, check_divergence="raise")`` following the prediction
             contract of survcraft.adapters.TorchModel.
         x : torch.Tensor, shape (n_samples, n_features)
             Floating feature matrix on the model device.
@@ -1130,6 +1219,8 @@ class PartialLikelihoodLoss(BaseSurvivalLoss):
             True for an observed event, False for right censoring.
         times : torch.Tensor, shape (n_samples,)
             Finite nonnegative event or censoring times on the model device.
+        check_divergence : {"raise", "warn", "skip", "no"}, default="raise"
+            Per-call policy following :meth:`BaseSurvivalLoss.forward`.
 
         Returns
         -------
@@ -1150,4 +1241,4 @@ class PartialLikelihoodLoss(BaseSurvivalLoss):
         BaseSurvivalLoss : Shared model, tensor, and device contracts.
         """
         check_survival_outcomes(events, times)
-        return partial_likelihood_vec_safe(model, x, events, times, epsilon=self.epsilon)
+        return partial_likelihood_vec_safe(model, x, events, times, epsilon=self.epsilon, check_divergence=check_divergence)

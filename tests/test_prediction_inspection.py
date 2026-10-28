@@ -27,31 +27,30 @@ def test_params_checks_transformed_values_and_names(policy):
         sm.FreeParameter("finite"),
         sm.PositiveParameter("overflow", func=torch.exp),
     ])
-    model = ad.TorchModel(torch.nn.Identity(), survival, check_divergence=policy)
+    model = ad.TorchModel(torch.nn.Identity(), survival)
     raw = torch.tensor([[1.0, 1000.0]])
 
     if policy == "raise":
         with pytest.raises(ValueError, match=r"non-finite.*params\[overflow\]") as caught:
-            model("params", raw)
+            model("params", raw, check_divergence=policy)
         context = caught.value.args[1]
         assert context["tensor_name"] == "params[overflow]"
         torch.testing.assert_close(context["raw_params"], raw)
         assert torch.isinf(context["tensor_values"]).all()
     elif policy == "warn":
         with pytest.warns(UserWarning, match=r"non-finite.*params\[overflow\]") as caught:
-            result = model("params", raw)
+            result = model("params", raw, check_divergence=policy)
         assert len(caught) == 1
         assert result.keys() == {"finite", "overflow"}
         assert torch.isinf(result["overflow"]).all()
     else:
-        assert torch.isinf(model("params", raw)["overflow"]).all()
+        assert torch.isinf(model("params", raw, check_divergence=policy)["overflow"]).all()
 
 
 @pytest.mark.parametrize("policy", ["raise", "warn", "no"])
 @pytest.mark.parametrize("scalar", [True, False])
 def test_nonfinite_time_predictions_have_correct_diagnostics(policy, scalar):
-    model = ad.TorchModel(torch.nn.Identity(), sm.WeibullSurvivalModule(),
-                          check_divergence=policy)
+    model = ad.TorchModel(torch.nn.Identity(), sm.WeibullSurvivalModule())
     # softplus(0) < 1 gives infinite hazard at zero; shape > 1 remains finite.
     raw = torch.tensor([[0.0, 0.0], [0.0, 2.0]])
     times = torch.tensor(0.0 if scalar else [0.0, 1.0])
@@ -59,7 +58,7 @@ def test_nonfinite_time_predictions_have_correct_diagnostics(policy, scalar):
 
     if policy == "raise":
         with pytest.raises(ValueError, match=message) as caught:
-            model("hazard", raw, times)
+            model("hazard", raw, times, check_divergence=policy)
         context = caught.value.args[1]
         assert context["tensor_name"] == "hazard"
         torch.testing.assert_close(context["times"], times)
@@ -67,9 +66,9 @@ def test_nonfinite_time_predictions_have_correct_diagnostics(policy, scalar):
     else:
         if policy == "warn":
             with pytest.warns(UserWarning, match=message):
-                result = model("hazard", raw, times)
+                result = model("hazard", raw, times, check_divergence=policy)
         else:
-            result = model("hazard", raw, times)
+            result = model("hazard", raw, times, check_divergence=policy)
         assert result.shape == ((2,) if scalar else (2, 2))
         assert torch.isinf(result).sum() == 1
 
