@@ -1300,6 +1300,16 @@ class SurvivalPredictor(SurvivalEstimator):
         Select whole batches directly from the dataset for training and
         validation. Set False to fetch individual samples and stack them
         using PyTorch's standard automatic batching.
+    compile : bool, default=False
+        Compile the training loss call, including its model computations.
+        Compilation is lazy and its cost is paid during training. The
+        optimizer, validation, and prediction remain eager. Start with
+        check_divergence='no' for fewer graph breaks. Compiler errors propagate
+        to the caller.
+    compile_kwargs : dict, default={"mode": "reduce-overhead"}
+        Options forwarded to ``torch.compile`` when compile=True. Each
+        estimator receives its own dictionary. An empty dictionary selects
+        PyTorch defaults. Ignored when compile=False.
     learning_rate : float, default=0.005
         Adam learning rate.
     weight_decay : float, default=0.0
@@ -1388,6 +1398,8 @@ class SurvivalPredictor(SurvivalEstimator):
     # these options give convenience but may have speed impact, should evaluate with some tests
     history: bool = False # collect training history data
     bulk_batching: bool = True
+    compile: bool = False
+    compile_kwargs: dict = field(default_factory=lambda: {"mode": "reduce-overhead"})
 
     def _make_data_loader(
         self, dataset: torch.utils.data.Dataset, *, shuffle: bool = False
@@ -1597,6 +1609,8 @@ class SurvivalPredictor(SurvivalEstimator):
         if not hasattr(self, "model_") or not warm_start:
             self._init_model(X, event, time)
             self.train_history_ = []
+            # TODO move here loss compilation and optimizer (into self.loss_ and self.optimizer_) so that in warm start we keep them
+            # what about test losses?
 
         if isinstance(self.loss, Module):
             self.loss.to(self._get_device())
@@ -1633,6 +1647,9 @@ class SurvivalPredictor(SurvivalEstimator):
                     lf.to(self._get_device())
 
         optimizer = torch.optim.Adam(self.model_.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+        training_loss = self.loss
+        if self.compile:
+            training_loss = torch.compile(training_loss, **self.compile_kwargs)
         epoch = -1
         transfer_batches_to = self._get_device() if self._get_device() != data_device else None
         
@@ -1655,7 +1672,7 @@ class SurvivalPredictor(SurvivalEstimator):
                     eb = eb.to(transfer_batches_to)
                     tb = tb.to(transfer_batches_to)
 
-                loss = self.loss(self.model_, Xb, eb, tb, check_divergence=self.check_divergence)
+                loss = training_loss(self.model_, Xb, eb, tb, check_divergence=self.check_divergence)
                 if self.check_divergence != "no":
                     loss_num = loss.item()
                     if not math.isfinite(loss_num):
