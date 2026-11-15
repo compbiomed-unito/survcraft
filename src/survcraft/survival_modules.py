@@ -1812,7 +1812,7 @@ class StepExpSurvivalModule(BaseSurvivalModule):
         fin_intervals = (times.unsqueeze(-1) >= time_breaks0[:-1]) & (
             times.unsqueeze(-1) < time_breaks0[1:]
         )
-        assert torch.all(torch.sum(fin_intervals, dim=-1) <= 1)
+        # Cumulative nonnegative interval lengths make these intervals disjoint.
         interval_density = (
             params[..., :-1] / interval_length
         )  # (time_breaks0[1:] - time_breaks0[:-1])
@@ -1821,12 +1821,15 @@ class StepExpSurvivalModule(BaseSurvivalModule):
         )
         # if no interval is true then we are in the infinite interval where density is not constant
         inf_intervals = torch.logical_not(torch.any(fin_intervals, dim=-1))
-        density[..., inf_intervals] = (
+        # Evaluate the tail at its start for inactive entries, avoiding unused
+        # exponentials (and their gradients) outside the tail's domain.
+        tail_times = torch.where(inf_intervals, times, time_breaks0[-1])
+        tail_density = (
             params[..., -1:]
-            * torch.exp(-(times[inf_intervals] / time_breaks0[-1] - 1.0))
+            * torch.exp(-(tail_times / time_breaks0[-1] - 1.0))
             / time_breaks0[-1]
         )
-        return density
+        return torch.where(inf_intervals, tail_density, density)
 
     def expected_time(self, params):
         r"""Return the expected event time.
