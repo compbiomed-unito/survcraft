@@ -137,7 +137,8 @@ def test_skipped_batches_report_the_actual_reasons(events, nonfinite_samples, ex
     loss = BatchLoss(nonfinite_samples)
     predictor = ad.SurvivalPredictor(loss=loss, epochs=1, batch_size=1,
                                      device="cpu", verbose=0, history=True,
-                                     bulk_batching=bulk_batching, check_divergence=policy)
+                                     bulk_batching=bulk_batching, check_divergence=policy,
+                                     skip_event_free_batches=True)
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -148,14 +149,17 @@ def test_skipped_batches_report_the_actual_reasons(events, nonfinite_samples, ex
             assert "no usable training batches remain" in message
         else:
             predictor.train(X, np.array(events), np.ones(len(events)))
-            message = str(caught[0].message)
+            message = str(caught[-1].message)
             assert len(predictor.train_history_[0][0]) == 1
             assert "no usable training batches remain" not in message
 
-    assert len(caught) == 1
+    summaries = [str(w.message) for w in caught if "Skipped training batches" in str(w.message)]
+    assert len(summaries) == 1
+    expected_individual_warnings = len(nonfinite_samples) if policy == "warn" else 0
+    assert len(caught) == 1 + expected_individual_warnings
     for reason in expected:
         assert reason in message
-        assert reason in str(caught[0].message)
+        assert reason in summaries[0]
     if not nonfinite_samples:
         assert "non-finite" not in message
     if all(events):
@@ -256,3 +260,21 @@ def test_bulk_batching_preserves_batches_weights_and_history(early_stopping, dev
     assert len(legacy.train_history_) == len(bulk.train_history_) == 2
     for old, new in zip(legacy.train_history_, bulk.train_history_):
         np.testing.assert_array_equal(old[0], new[0])
+
+
+@pytest.mark.parametrize("events", [[False, False], [False, True]])
+@pytest.mark.parametrize("bulk_batching", [False, True])
+def test_default_trains_event_free_batches_without_checking(events, bulk_batching, monkeypatch):
+    def unexpected_any(*args, **kwargs):
+        raise AssertionError("Training must not check for events by default")
+
+    loss = BatchLoss()
+    predictor = ad.SurvivalPredictor(
+        loss=loss, epochs=1, batch_size=1, history=True,
+        bulk_batching=bulk_batching, check_divergence="no")
+    assert predictor.skip_event_free_batches is False
+    monkeypatch.setattr(torch.Tensor, "any", unexpected_any)
+    predictor.train(np.ones((2, 1), dtype=np.float32),
+                    np.array(events), np.ones(2))
+    assert loss.calls == 2
+    assert len(predictor.train_history_[0][0]) == 2

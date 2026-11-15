@@ -1300,6 +1300,10 @@ class SurvivalPredictor(SurvivalEstimator):
         Select whole batches directly from the dataset for training and
         validation. Set False to fetch individual samples and stack them
         using PyTorch's standard automatic batching.
+    skip_event_free_batches : bool, default=False
+        Skip training batches containing no observed events. When False,
+        batches are passed to the loss without checking for events. This
+        option does not affect validation batches or divergence checks.
     compile : bool, default=False
         Compile the training loss call, including its model computations.
         Compilation is lazy and its cost is paid during training. The
@@ -1398,6 +1402,7 @@ class SurvivalPredictor(SurvivalEstimator):
     # these options give convenience but may have speed impact, should evaluate with some tests
     history: bool = False # collect training history data
     bulk_batching: bool = True
+    skip_event_free_batches: bool = False
     compile: bool = False
     compile_kwargs: dict = field(default_factory=lambda: {"mode": "reduce-overhead"})
 
@@ -1664,9 +1669,9 @@ class SurvivalPredictor(SurvivalEstimator):
             event_free_batches = 0
             nonfinite_loss_batches = 0
             for batch, (Xb, eb, tb) in enumerate(train_dl):
-                if not eb.any():  # # no event
+                if self.skip_event_free_batches and not eb.any():
                     event_free_batches += 1
-                    continue # ignore batch
+                    continue
                 if transfer_batches_to is not None:
                     Xb = Xb.to(transfer_batches_to)
                     eb = eb.to(transfer_batches_to)
