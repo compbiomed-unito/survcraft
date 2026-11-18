@@ -2,22 +2,27 @@
 
 Run ``python benchmark/benchmark_models.py --help`` for CLI options. The CLI
 sweeps zero-argument survival/loss constructors; ``run_benchmark`` accepts
-named factories for arbitrary predictor configurations. Output files are replaced.
+named factories for arbitrary predictor configurations. Pass an existing CSV as a
+positional argument to generate a PDF report instead of running fits, for example
+``python benchmark/benchmark_models.py results.csv --metric fit_seconds``.
+Reporting requires SurvCraft's plotting extra. Output files are replaced.
 """
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 from functools import partial
 import csv
 import inspect
 from importlib import metadata as package_metadata
 import itertools
 import json
+import math
 from pathlib import Path
 import platform
 import random
 import statistics
 import sys
+import textwrap
 import time
 import warnings
 
@@ -36,10 +41,164 @@ from survcraft.util import get_loss_modules, get_survival_adapters
 FIELDS = [
     "dataset", "configuration", "device", "repeat", "split_seed", "training_seed",
     "n_train", "n_test", "n_features", "train_events", "eval_events",
-    "batch_size", "learning_rate", "epochs", "early_stopping", "options",
+    "batch_size", "learning_rate", "epochs", "early_stopping",
     "fit_seconds", "antolini_concordance", "integrated_brier_score",
     "status", "errors", "warnings",
 ]
+
+
+METRICS = {
+    "antolini_concordance": "Antolini concordance (higher is better)",
+    "integrated_brier_score": "Integrated Brier score (lower is better)",
+    "fit_seconds": "Fit time in seconds (lower is better)",
+}
+ARGUMENTS = {"configuration", "device", "batch_size", "learning_rate", "epochs",
+             "early_stopping"}
+
+
+def _category(value):
+    # Canonicalize structured options so JSON key order does not split groups.
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        return value
+    if isinstance(parsed, (dict, list)):
+        return json.dumps(parsed, sort_keys=True, ensure_ascii=False)
+    return value
+
+
+def create_report(source, output=None, metric="antolini_concordance", columns=None, hue=None):
+    """Write per-dataset boxplots and return the output PDF path.
+
+    Parameters
+    ----------
+    source : str or pathlib.Path
+        CSV produced by benchmark_models.py with expanded option columns.
+    output : str or pathlib.Path or None, default=None
+        Destination; defaults to ``<source_stem>_<metric>.pdf`` beside the CSV.
+    metric : str, default="antolini_concordance"
+        One of ``antolini_concordance``, ``integrated_brier_score``, ``fit_seconds``.
+    columns : sequence of str or None, default=None
+        Columns to group by. Defaults to configuration, device, training arguments,
+        and every ``option_`` column. Blank values are omitted from each grouping.
+        Columns with fewer than two distinct nonblank values per dataset are skipped.
+    hue : str or None, default=None
+        CSV column used to split boxes by color. Rows with a blank hue are omitted.
+
+    Returns
+    -------
+    pathlib.Path
+        Written PDF. Each column has separate pages per dataset, with at most
+        eight categories per page. Boxes pool runs across all other settings.
+
+    Raises
+    ------
+    ValueError
+        If columns or metric are invalid, or no nonconstant plots remain.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    import pandas as pd
+    import seaborn as sns
+
+    if metric not in METRICS:
+        raise ValueError(f"Unknown metric: {metric}")
+    source = Path(source)
+    output = Path(output) if output is not None else source.with_name(
+        f"{source.stem}_{metric}.pdf")
+    if source.resolve() == output.resolve():
+        raise ValueError("Output must differ from the input CSV")
+    with source.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        fields = reader.fieldnames or []
+        selected = (list(columns) if columns is not None else
+                    [key for key in fields if key in ARGUMENTS or key.startswith("option_")])
+        missing = {"dataset", "status", metric, *selected} - set(fields)
+        if hue is not None and hue not in fields:
+            missing.add(hue)
+        if missing:
+            raise ValueError(f"Missing CSV columns: {', '.join(sorted(missing))}")
+        if not selected:
+            raise ValueError("No model argument or option columns to plot")
+        datasets = defaultdict(list)
+        total = 0
+        for row in reader:
+            total += 1
+            try:
+                value = float(row[metric])
+            except (ValueError, TypeError):
+                continue
+            if row["status"] in ("success", "partial") and math.isfinite(value):
+                datasets[row["dataset"]].append((row, value))
+    included = sum(map(len, datasets.values()))
+    if not included:
+        raise ValueError(f"No successful or partial runs with finite {metric}")
+    plots = []
+    for dataset, cases in sorted(datasets.items()):
+        for column in selected:
+            records = []
+            for row, value in cases:
+                category = row.get(column, "").strip()
+                color = row.get(hue, "").strip() if hue is not None else ""
+                if category and (hue is None or color):
+                    records.append({"category": _category(category), "value": value,
+                                    "hue": _category(color)})
+            if len({record["category"] for record in records}) > 1:
+                plots.append((dataset, len(cases), column, pd.DataFrame(records)))
+    if not plots:
+        raise ValueError("No nonconstant columns remain after filtering blank options and hue")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with PdfPages(output) as pdf:
+        for dataset, case_count, column, data in plots:
+            counts = data["category"].value_counts()
+            categories = sorted(counts.index)
+            hue_order = sorted(data["hue"].unique()) if hue is not None else None
+            palette = (dict(zip(hue_order, sns.color_palette(n_colors=len(hue_order))))
+                       if hue_order is not None else None)
+            for start in range(0, len(categories), 8):
+                page_categories = categories[start:start + 8]
+                labels = [textwrap.fill(f"{key}  (n={counts[key]})", 65,
+                                        break_long_words=True)
+                          for key in page_categories]
+                # Reserve space per row for its labels and split boxes, with
+                # fixed margins rather than a large minimum page height.
+                height = max(2.2, 1.35 + sum(
+                    max((label.count("\n") + 1) * 0.22,
+                        len(hue_order or [None]) * 0.18)
+                    for label in labels))
+                fig, ax = plt.subplots(figsize=(14, height))
+                try:
+                    sns.boxplot(data=data[data["category"].isin(page_categories)],
+                                x="value", y="category", order=page_categories,
+                                hue="hue" if hue is not None else None,
+                                hue_order=hue_order, palette=palette, dodge=True,
+                                orient="h", showmeans=True, ax=ax)
+                    ax.set_yticks(range(len(page_categories)), labels=labels)
+                    ax.set_ylabel(column)
+                    if hue is not None:
+                        legend = ax.legend(title=hue, loc="upper left",
+                                           bbox_to_anchor=(1.02, 1))
+                        for label in legend.get_texts():
+                            label.set_text(textwrap.fill(label.get_text(), 40))
+                    ax.set_xlabel(METRICS[metric])
+                    ax.set_title(f"{dataset} — {column}\n"
+                                 f"Categories {start + 1}–{start + len(page_categories)}"
+                                 f" of {len(categories)}")
+                    ax.grid(axis="x", alpha=0.3)
+                    fig.text(0.02, 0.06 / height,
+                             f"{source.name} | Usable rows: {included}/{total}; "
+                             f"dataset: {case_count}; grouped: {len(data)}\n"
+                             "Blank options/hue omitted. Boxes pool other settings and repeats; "
+                             "group differences do not isolate an option's effect.", fontsize=8)
+                    fig.tight_layout(rect=(0, 0.38 / height, 1, 1), pad=0.6)
+                    pdf.savefig(fig)
+                finally:
+                    plt.close(fig)
+    return output
 
 
 def _json_default(value):
@@ -284,6 +443,8 @@ def run_benchmark(models, datasets=None, *, repeats=3, warmup_epochs=1,
         stay together; datasets and the Cox reference are prepared in the parent.
     output : str or pathlib.Path, optional
         CSV path. This file and its .metadata.json companion are replaced.
+        Model options use one ``option_<key>`` column per top-level key;
+        nested dictionaries and lists are JSON-encoded. Missing options are blank.
     run_metadata : dict or None, optional
         Additional caller metadata, such as CLI arguments.
 
@@ -358,14 +519,29 @@ def run_benchmark(models, datasets=None, *, repeats=3, warmup_epochs=1,
         metadata_path.write_text(json.dumps(metadata, default=_json_default, indent=2) + "\n")
 
     with output.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=FIELDS)
+        writer = csv.DictWriter(stream, fieldnames=FIELDS.copy())
         writer.writeheader()
         stream.flush()
 
+        def csv_row(row):
+            values = {key: value for key, value in row.items() if key != "options"}
+            values.update({f"option_{key}": value
+                           for key, value in row.get("options", {}).items()})
+            return {key: json.dumps(value, default=_json_default)
+                    if isinstance(value, (dict, list)) else value
+                    for key, value in values.items()}
+
         def record(row):
-            writer.writerow({key: json.dumps(value, default=_json_default)
-                             if isinstance(value, (dict, list)) else value
-                             for key, value in row.items()})
+            values = csv_row(row)
+            new_fields = [key for key in values if key not in writer.fieldnames]
+            if new_fields:
+                writer.fieldnames.extend(new_fields)
+                # Models can expose different options. Expand earlier rows too.
+                stream.seek(0)
+                stream.truncate()
+                writer.writeheader()
+                writer.writerows(csv_row(previous) for previous in rows)
+            writer.writerow(values)
             stream.flush()
             rows.append(row)
             if "options" in row:
@@ -467,8 +643,15 @@ def _make_predictor(survival, loss, batch_size, epochs, device, early_stopping=F
 
 
 def main():
-    """Run the CLI grid and return zero if at least one fit produced valid parameters."""
+    """Run the benchmark grid or plot an existing CSV; return an exit status."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("csv", nargs="?", type=Path,
+                        help="Plot this existing benchmark CSV instead of running fits")
+    parser.add_argument("--metric", choices=METRICS, default="antolini_concordance",
+                        help="Report score or fit time (default: antolini_concordance)")
+    parser.add_argument("--columns", nargs="+",
+                        help="Report only these CSV columns (default: nonconstant arguments/options)")
+    parser.add_argument("--hue", help="Report CSV column used to split boxes by color")
     parser.add_argument("--datasets", nargs="+", default=["all"],
                         help="Dataset names such as sksurv:whas500, or all (default: all)")
     parser.add_argument("--survivals", nargs="+", default=["all"],
@@ -501,9 +684,19 @@ def main():
                         help="Positive cap on training rows, sampled after preprocessing (default: no cap)")
     parser.add_argument("--filter-small-datasets", action="store_true",
                         help="Exclude datasets with fewer than two training samples per feature after downsampling (default: off)")
-    parser.add_argument("--output", type=Path, default=Path("benchmark/results/models.csv"),
-                        help="CSV path; replaces it and its .metadata.json companion (default: %(default)s)")
+    parser.add_argument("--output", type=Path,
+                        help="Output path (default: benchmark/results/models.csv for fits, "
+                             "<csv_stem>_<metric>.pdf for reports); existing files are replaced")
     args = parser.parse_args()
+    if args.csv is not None:
+        try:
+            output = create_report(args.csv, args.output, args.metric, args.columns, args.hue)
+        except (ValueError, OSError, ImportError) as exc:
+            parser.error(str(exc))
+        print(f"Saved {output}")
+        return 0
+    if args.output is None:
+        args.output = Path("benchmark/results/models.csv")
     try:
         if min(*args.batch_sizes, *args.epochs, args.repeats) < 1:
             raise ValueError("Batch sizes, epochs, and repeats must be positive")

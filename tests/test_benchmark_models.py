@@ -86,7 +86,13 @@ def test_failures_do_not_prevent_later_cases_or_persisted_results(tmp_path, monk
     saved = list(csv.DictReader(output.open()))
     assert len(saved) == len(rows)
     assert saved[0]["fit_seconds"] == ""
-    assert json.loads(saved[-1]["options"])["epochs"] == 1
+    assert "options" not in saved[-1]
+    assert saved[-1]["option_epochs"] == "1"
+    assert json.loads(saved[-1]["option_input"])["options"]["hidden_sizes"] == [4]
+    assert saved[1]["option_alpha"] == "1.0"
+    assert saved[1]["option_epochs"] == ""
+    assert saved[-1]["option_alpha"] == ""
+    assert saved[0]["option_epochs"] == ""
     metadata = json.loads(output.with_suffix(".metadata.json").read_text())
     assert metadata["counts"] == {"failed": 3, "success": 3, "unsupported": 2}
     assert metadata["datasets"]["valid"]["train_indices"] == list(range(20))
@@ -195,6 +201,7 @@ def test_cli_early_stopping_and_training_cap(monkeypatch, early_stopping):
         arguments.append("--early-stopping")
     monkeypatch.setattr("sys.argv", arguments)
     assert benchmark.main() == 0
+    assert captured["output"] == Path("benchmark/results/models.csv")
     assert captured["max_train_samples"] == 8
     assert len(captured["models"]) == 2
     assert all(model.early_stopping is early_stopping for model in captured["models"])
