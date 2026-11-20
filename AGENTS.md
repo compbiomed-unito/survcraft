@@ -1,6 +1,8 @@
 ## Coding
 Code should be readable and, when possibile, concise. In particular, some validation of input is good but there is no need for overly long chunks of validation code that will hide the functional code. Do not overengineer. If you believe a non-explicitly required feature or check would be a good idea, ask confirmation before starting to implement it.
-
+Benchmarking should be done with the benchmark/benchmark_models.py if feasible.
+Plotting should use the plot functions in SurvivalPredictor and SurvivalSimulator when feasible.
+Test datasets can be retrieved with the survcraft/datasets.py submodule, preferring those from sksurv.
 
 ## Git
 Do not perform any commit or other change to the git configuration. Especially do not push or change in any way the remote github repository.
